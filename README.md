@@ -5,11 +5,7 @@ This repository contains tools and experiments for performing anomaly detection 
 
 ##  Installation
  **Note:** This setup guide is designed for **Windows environments**.
-```bash
-cd <COLCON_WORKSPACE>
-colcon build --symlink-install
-source install/local_setup.bash
-```
+
 Follow these steps to set up your workspace:
 
 **Create your workspace folder (e.g., `AD`)**:
