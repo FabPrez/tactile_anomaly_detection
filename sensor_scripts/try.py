@@ -1,4 +1,4 @@
-from gscaputre import GelSightCapture
+from tactile_anomaly_detection.sensor_scripts.gscapture import GelSightCapture
 import os
 import time
 import cv2
