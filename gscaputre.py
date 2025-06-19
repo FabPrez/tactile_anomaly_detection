@@ -9,7 +9,7 @@ import sys
 anomaly_detection_dir = os.path.dirname(os.path.abspath(__file__))
 gsrobotics_dir = os.path.join(anomaly_detection_dir, '..', 'gsrobotics')
 nn_model_path = os.path.join(gsrobotics_dir, 'models', 'nnmini.pt')
-save_dir = gsrobotics_dir
+# save_dir = gsrobotics_dir
 sys.path.append(gsrobotics_dir)
 sys.path.append(anomaly_detection_dir)
 
@@ -20,7 +20,6 @@ class GelSightCapture:
     def __init__(
         self,
         model_path: str,
-        save_dir: str,
         camera_width: int = 320,
         camera_height: int = 240,
         marker_mask_min: int = 0,
@@ -32,7 +31,6 @@ class GelSightCapture:
         self.camera_height = camera_height
         self.marker_mask_min = marker_mask_min
         self.marker_mask_max = marker_mask_max
-        self.save_dir = save_dir
 
         self.cam = GelSightMini(target_width=camera_width, target_height=camera_height)
         self.cam.select_device(device_idx=camera_index)
@@ -73,12 +71,12 @@ class GelSightCapture:
             self.latest_frame = frame
             self.latest_depth = depth_map
 
-    def save_frame(self, frame_rgb, depth_map):
+    def save_frame(self, frame_rgb, depth_map, save_dir):
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
         # Salva immagine RGB
         image_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-        img_path = os.path.join(self.save_dir, f"image_gs_mini_{timestamp}.png")
+        img_path = os.path.join(save_dir, f"image_gs_mini_{timestamp}.png")
         cv2.imwrite(img_path, image_bgr)
         print(f"✅ Immagine RGB salvata: {img_path}")
 
@@ -103,7 +101,7 @@ class GelSightCapture:
 
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(np.array(points))
-        pc_path = os.path.join(self.save_dir, f"pointcloud_gs_mini_{timestamp}.ply")
+        pc_path = os.path.join(save_dir, f"pointcloud_gs_mini_{timestamp}.ply")
         o3d.io.write_point_cloud(pc_path, pcd)
         print(f"✅ Point cloud salvata: {pc_path}")
 
