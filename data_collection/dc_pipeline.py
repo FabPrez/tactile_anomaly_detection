@@ -31,6 +31,8 @@ def start_pipeline(pezzo_num, number_of_diff_poses, number_of_acquisition_per_po
 
             # 3. Invia comando '9' per avanzare
             rsc.send_message("9")
+            
+            #TODO: bisognerebbe far allontanare il robot e poi far "ri-toccare" l'oggetto per ogni nuova misura
     
     rsc.close()
 
