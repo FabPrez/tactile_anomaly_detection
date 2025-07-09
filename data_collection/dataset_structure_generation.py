@@ -27,14 +27,25 @@ def create_structure_for_PZ1(base_dir=BASE_DATASET_DIR):
     return pezzo_path
 
 def create_structure_for_PZ2(base_dir=BASE_DATASET_DIR):
-    #TODO: WIP
-    return
+    pezzo_name = "PZ2"
+    posizioni = [f"pos{i}" for i in range(1, 10)]  # pos1 to pos 9
+    subfolders = ["rgb", "pointcloud"]
+    pezzo_path = os.path.join(base_dir, pezzo_name)
+    os.makedirs(pezzo_path, exist_ok=True)
+
+    for posizione in posizioni:
+        posizione_path = os.path.join(pezzo_path, posizione)
+        for subfolder in subfolders:
+            folder_path = os.path.join(posizione_path, subfolder)
+            os.makedirs(folder_path, exist_ok=True)
+
+    return pezzo_path
 
 def get_dataset_path(pezzo, base_dir=BASE_DATASET_DIR):
     if pezzo == "PZ1":
         return create_structure_for_PZ1(base_dir)
     elif pezzo == "PZ2":
-        raise NotImplementedError("La struttura per 'PZ2' non è ancora implementata.")
+        return create_structure_for_PZ2(base_dir)
     else:
         raise ValueError(f"Pezzo '{pezzo}' non riconosciuto.")
     
@@ -52,5 +63,6 @@ def get_dataset_root_path(pezzo, base_dir=BASE_DATASET_DIR):
 
 # Esempio d'uso
 if __name__ == "__main__":
-    path = get_dataset_path("PZ1") # PZ1 | PZ2 | PZ3 | PZ4
-    print(f"Struttura creata per 'PZ1' in: {os.path.abspath(path)}")
+    path = get_dataset_path("PZ2") # PZ1 | PZ2 | PZ3 | PZ4
+    print(f"Struttura creata per 'PZ2' in: {os.path.abspath(path)}")
+    

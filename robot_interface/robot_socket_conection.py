@@ -54,3 +54,6 @@ class RobotSocketInterface:
             self.server_socket.close()
         print("[RobotSocketInterface] Connection closed")
 
+
+if __name__ == "__main__":
+    rsc = RobotSocketInterface()

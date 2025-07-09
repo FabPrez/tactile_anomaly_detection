@@ -1,13 +1,16 @@
-from tactile_anomaly_detection.sensor_scripts.gscapture import GelSightCapture
+from gscapture import GelSightCapture
 import os
 import time
 import cv2
 
 # === Setup ===
 script_dir = os.path.dirname(os.path.abspath(__file__))
-gsrobotics_dir = os.path.join(script_dir, '..', 'gsrobotics')
+gsrobotics_dir = os.path.join(script_dir, '..', '..','gsrobotics')
 model_path = os.path.join(gsrobotics_dir, 'models', 'nnmini.pt')
 save_dir = gsrobotics_dir
+print("------")
+print(model_path)
+print("------")
 
 gs = GelSightCapture(model_path=model_path)
 

@@ -1,7 +1,7 @@
 import socket
 import time
 
-def start_server(host='0.0.0.0', port=3555):
+def start_server(host='192.168.0.153', port=3555):
     # Create a TCP/IP socket
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     
