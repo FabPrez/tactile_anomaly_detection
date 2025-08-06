@@ -19,7 +19,7 @@ from robot_interface import robot_socket_conection
 from sensor_scripts import gscapture
 from dataset_structure_generation import get_dataset_root_path
 
-def start_pipeline(pezzo_num, number_of_diff_poses, number_of_acquisition_per_pose):
+def start_pipeline(pezzo_num, number_of_diff_poses, number_of_acquisition_per_pose,fault_data_acquisiton=False):
     sensor = gscapture.GelSightCapture()
     rsc = robot_socket_conection.RobotSocketInterface()
     rsc.select_pezzo(pezzo_num)  # Seleziona il pezzo
@@ -36,6 +36,10 @@ def start_pipeline(pezzo_num, number_of_diff_poses, number_of_acquisition_per_po
     for pose_idx in range(1, number_of_diff_poses + 1):
         pose_name = f"pos{pose_idx}"
         save_path = os.path.join(pezzo_root_path, pose_name)
+        
+        if fault_data_acquisiton:
+            save_path = os.path.join(pezzo_root_path,pose_name,'fault')
+            
         print(f"\n--- Inizio acquisizione per {pose_name} ---")
 
         for acq_idx in range(1, number_of_acquisition_per_pose + 1):

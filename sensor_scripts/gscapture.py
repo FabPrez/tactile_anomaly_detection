@@ -79,7 +79,7 @@ class GelSightCapture:
 
         # Salva immagine RGB
         image_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-        img_path = os.path.join(save_dir, f"image_gs_mini_{timestamp}.png")
+        img_path = os.path.join(save_dir, "rgb",f"image_gs_mini_{timestamp}.png")
         cv2.imwrite(img_path, image_bgr)
         print(f"✅ Immagine RGB salvata: {img_path}")
 
@@ -104,7 +104,7 @@ class GelSightCapture:
 
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(np.array(points))
-        pc_path = os.path.join(save_dir, f"pointcloud_gs_mini_{timestamp}.ply")
+        pc_path = os.path.join(save_dir,"pointcloud", f"pointcloud_gs_mini_{timestamp}.ply")
         o3d.io.write_point_cloud(pc_path, pcd)
         print(f"✅ Point cloud salvata: {pc_path}")
 
