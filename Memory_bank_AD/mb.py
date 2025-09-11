@@ -1,141 +1,262 @@
-import os
-from pathlib import Path
-from typing import List
-import random
-
+import argparse
 import numpy as np
-from PIL import Image
+import os
+import pickle
 from tqdm import tqdm
+from collections import OrderedDict
+from sklearn.metrics import roc_auc_score
+from sklearn.metrics import roc_curve
+from sklearn.metrics import precision_recall_curve
+from scipy.ndimage import gaussian_filter
 import matplotlib.pyplot as plt
 
 import torch
-from torchvision import models
-from sklearn.neighbors import NearestNeighbors
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from torchvision.models import wide_resnet50_2
 
-from dataio import list_images_by_part
-from transforms_util import build_resnet_preprocess
+import datasets.mvtec as mvtec
 
-# --- Feature extractor semplice (ResNet18, layer3) ---
-class SimpleResNetExtractor(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-        base = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
-        self.features = torch.nn.Sequential(
-            base.conv1, base.bn1, base.relu, base.maxpool,
-            base.layer1, base.layer2, base.layer3
-        )
-        for p in self.parameters():
-            p.requires_grad_(False)
-        self.eval()
 
-    @torch.no_grad()
-    def forward(self, x):
-        feats = self.features(x)  # (B, 256, 14, 14)
-        B, C, H, W = feats.shape
-        return feats.view(B, C, H * W).permute(0, 2, 1)  # (B, H*W, C)
+def parse_args():
+    parser = argparse.ArgumentParser('SPADE')
+    parser.add_argument("--top_k", type=int, default=5)
+    parser.add_argument("--save_path", type=str, default="./result")
+    return parser.parse_args()
 
-# --- Funzione per estrarre feature da una lista di immagini ---
-def extract_features(paths: List[Path], extractor, preprocess, device) -> np.ndarray:
-    if len(paths) == 0:
-        print("Nessuna immagine trovata per estrarre le feature.")
-        return np.empty((0, 256))
-    all_feats = []
-    for p in tqdm(paths, desc="Extracting features"):
-        img = Image.open(p).convert("RGB")
-        x = preprocess(img).unsqueeze(0).to(device)
-        feats = extractor(x)[0].cpu().numpy()  # (H*W, C)
-        all_feats.append(feats)
-    return np.concatenate(all_feats, axis=0)  # (Npatch_tot, C)
-
-# --- Funzione per calcolare anomaly score su immagini ---
-def anomaly_scores_with_map(paths: List[Path], extractor, preprocess, knn, device) -> tuple[np.ndarray, list[np.ndarray]]:
-    scores = []
-    maps = []
-    for p in tqdm(paths, desc="Scoring"):
-        img = Image.open(p).convert("RGB")
-        x = preprocess(img).unsqueeze(0).to(device)
-        feats = extractor(x)[0].cpu().numpy()  # (H*W, C)
-        dists, _ = knn.kneighbors(feats)
-        patch_scores = dists[:, 0]  # (H*W,)
-        scores.append(np.max(patch_scores))  # score globale = max patch
-        map_ = patch_scores.reshape(14, 14)
-        maps.append(map_)
-    return np.array(scores), maps
 
 def main():
-    # --- Configurazione ---
-    DATASET_ROOT = os.path.join(os.path.dirname(__file__))  # Memory_bank_AD come root
-    PART = "PZ1"  # Nome del pezzo da analizzare
-    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    PREPROCESS = build_resnet_preprocess(target_size=224, mode="letterbox")
 
-    # --- Assicurati che la cartella esista e abbia la struttura corretta ---
-    part_dir = os.path.join(DATASET_ROOT, PART)
-    pos_dir = os.path.join(part_dir, "pos1")
-    rgb_dir = os.path.join(pos_dir, "rgb")
-    fault_rgb_dir = os.path.join(pos_dir, "fault", "rgb")
+    args = parse_args()
 
-    if not os.path.exists(rgb_dir):
-        print(f"Creo la struttura {rgb_dir}")
-        os.makedirs(rgb_dir, exist_ok=True)
-    if not os.path.exists(fault_rgb_dir):
-        print(f"Creo la struttura {fault_rgb_dir}")
-        os.makedirs(fault_rgb_dir, exist_ok=True)
+    # device setup
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    # --- Carica immagini buone e difettose ---
-    good_paths, defect_paths = list_images_by_part(DATASET_ROOT, PART)
-    print(f"Trovate {len(good_paths)} immagini buone e {len(defect_paths)} difettose per {PART}")
+    # load model
+    model = wide_resnet50_2(pretrained=True, progress=True)
+    model.to(device)
+    model.eval()
 
-    if len(good_paths) == 0:
-        print("Errore: nessuna immagine buona trovata. Inserisci immagini in data/PZ1/good.")
-        return
-    if len(defect_paths) == 0:
-        print("Attenzione: nessuna immagine difettosa trovata. Inserisci immagini in data/PZ1/defect.")
+    # set model's intermediate outputs
+    outputs = []
+    def hook(module, input, output):
+        outputs.append(output)
+    model.layer1[-1].register_forward_hook(hook)
+    model.layer2[-1].register_forward_hook(hook)
+    model.layer3[-1].register_forward_hook(hook)
+    model.avgpool.register_forward_hook(hook)
 
-    # --- Suddividi immagini buone in train/test ---
-    random.seed(42)
-    n_train = int(0.7 * len(good_paths))  # 70% train, 30% test
-    good_paths_shuffled = good_paths.copy()
-    random.shuffle(good_paths_shuffled)
-    train_good = good_paths_shuffled[:n_train]
-    test_good = good_paths_shuffled[n_train:]
+    os.makedirs(os.path.join(args.save_path, 'temp'), exist_ok=True)
 
-    print(f"Suddivisione: {len(train_good)} train, {len(test_good)} test buone")
+    fig, ax = plt.subplots(1, 2, figsize=(20, 10))
+    fig_img_rocauc = ax[0]
+    fig_pixel_rocauc = ax[1]
 
-    # --- Costruisci il memory bank dalle immagini buone di train ---
-    extractor = SimpleResNetExtractor().to(DEVICE)
-    memory_bank = extract_features(train_good, extractor, PREPROCESS, DEVICE)
+    total_roc_auc = []
+    total_pixel_roc_auc = []
 
-    # --- Costruisci kNN ---
-    knn = NearestNeighbors(n_neighbors=1, metric="euclidean")
-    knn.fit(memory_bank)
+    for class_name in mvtec.CLASS_NAMES:
 
-    # --- Calcola anomaly scores e mappe ---
-    test_good_scores, test_good_maps = anomaly_scores_with_map(test_good, extractor, PREPROCESS, knn, DEVICE)
-    defect_scores, defect_maps = anomaly_scores_with_map(defect_paths, extractor, PREPROCESS, knn, DEVICE)
+        train_dataset = mvtec.MVTecDataset(class_name=class_name, is_train=True)
+        train_dataloader = DataLoader(train_dataset, batch_size=32, pin_memory=True)
+        test_dataset = mvtec.MVTecDataset(class_name=class_name, is_train=False)
+        test_dataloader = DataLoader(test_dataset, batch_size=32, pin_memory=True)
 
-    # --- Stampa statistiche ---
-    print(f"Score immagini buone (test): min={test_good_scores.min():.3f}  med={np.median(test_good_scores):.3f}  max={test_good_scores.max():.3f}")
-    print(f"Score immagini difettose: min={defect_scores.min():.3f}  med={np.median(defect_scores):.3f}  max={defect_scores.max():.3f}")
+        train_outputs = OrderedDict([('layer1', []), ('layer2', []), ('layer3', []), ('avgpool', [])])
+        test_outputs = OrderedDict([('layer1', []), ('layer2', []), ('layer3', []), ('avgpool', [])])
 
-    # --- Threshold per segnalare anomalie ---
-    threshold = np.percentile(test_good_scores, 99)
-    print(f"\nRisultati classificazione immagini test (buone e difettose):")
-    for p, s, amap in zip(test_good, test_good_scores, test_good_maps):
-        if s > threshold:
-            print(f"  {p.name} (score={s:.3f}) --> DIFETTOSA")
+        # extract train set features
+        train_feature_filepath = os.path.join(args.save_path, 'temp', 'train_%s.pkl' % class_name)
+        if not os.path.exists(train_feature_filepath):
+            for (x, y, mask) in tqdm(train_dataloader, '| feature extraction | train | %s |' % class_name):
+                # model prediction
+                with torch.no_grad():
+                    pred = model(x.to(device))
+                # get intermediate layer outputs
+                for k, v in zip(train_outputs.keys(), outputs):
+                    train_outputs[k].append(v)
+                # initialize hook outputs
+                outputs = []
+            for k, v in train_outputs.items():
+                train_outputs[k] = torch.cat(v, 0)
+            # save extracted feature
+            with open(train_feature_filepath, 'wb') as f:
+                pickle.dump(train_outputs, f)
         else:
-            print(f"  {p.name} (score={s:.3f}) --> BUONA")
-    for p, s, amap in zip(defect_paths, defect_scores, defect_maps):
-        if s > threshold:
-            print(f"  {p.name} (score={s:.3f}) --> DIFETTOSA")
-            plt.figure()
-            plt.title(f"Anomaly map: {p.name}")
-            plt.imshow(amap, cmap="jet")
-            plt.colorbar()
-            plt.show()
-        else:
-            print(f"  {p.name} (score={s:.3f}) --> BUONA")
+            print('load train set feature from: %s' % train_feature_filepath)
+            with open(train_feature_filepath, 'rb') as f:
+                train_outputs = pickle.load(f)
 
-if __name__ == "__main__":
+        gt_list = []
+        gt_mask_list = []
+        test_imgs = []
+
+        # extract test set features
+        for (x, y, mask) in tqdm(test_dataloader, '| feature extraction | test | %s |' % class_name):
+            test_imgs.extend(x.cpu().detach().numpy())
+            gt_list.extend(y.cpu().detach().numpy())
+            gt_mask_list.extend(mask.cpu().detach().numpy())
+            # model prediction
+            with torch.no_grad():
+                pred = model(x.to(device))
+            # get intermediate layer outputs
+            for k, v in zip(test_outputs.keys(), outputs):
+                test_outputs[k].append(v)
+            # initialize hook outputs
+            outputs = []
+        for k, v in test_outputs.items():
+            test_outputs[k] = torch.cat(v, 0)
+
+        # calculate distance matrix
+        dist_matrix = calc_dist_matrix(torch.flatten(test_outputs['avgpool'], 1),
+                                       torch.flatten(train_outputs['avgpool'], 1))
+
+        # select K nearest neighbor and take average
+        topk_values, topk_indexes = torch.topk(dist_matrix, k=args.top_k, dim=1, largest=False)
+        scores = torch.mean(topk_values, 1).cpu().detach().numpy()
+
+        # calculate image-level ROC AUC score
+        fpr, tpr, _ = roc_curve(gt_list, scores)
+        roc_auc = roc_auc_score(gt_list, scores)
+        total_roc_auc.append(roc_auc)
+        print('%s ROCAUC: %.3f' % (class_name, roc_auc))
+        fig_img_rocauc.plot(fpr, tpr, label='%s ROCAUC: %.3f' % (class_name, roc_auc))
+
+        score_map_list = []
+        for t_idx in tqdm(range(test_outputs['avgpool'].shape[0]), '| localization | test | %s |' % class_name):
+            score_maps = []
+            for layer_name in ['layer1', 'layer2', 'layer3']:  # for each layer
+
+                # construct a gallery of features at all pixel locations of the K nearest neighbors
+                topk_feat_map = train_outputs[layer_name][topk_indexes[t_idx]]
+                test_feat_map = test_outputs[layer_name][t_idx:t_idx + 1]
+                feat_gallery = topk_feat_map.transpose(3, 1).flatten(0, 2).unsqueeze(-1).unsqueeze(-1)
+
+                # calculate distance matrix
+                dist_matrix_list = []
+                for d_idx in range(feat_gallery.shape[0] // 100):
+                    dist_matrix = torch.pairwise_distance(feat_gallery[d_idx * 100:d_idx * 100 + 100], test_feat_map)
+                    dist_matrix_list.append(dist_matrix)
+                dist_matrix = torch.cat(dist_matrix_list, 0)
+
+                # k nearest features from the gallery (k=1)
+                score_map = torch.min(dist_matrix, dim=0)[0]
+                score_map = F.interpolate(score_map.unsqueeze(0).unsqueeze(0), size=224,
+                                          mode='bilinear', align_corners=False)
+                score_maps.append(score_map)
+
+            # average distance between the features
+            score_map = torch.mean(torch.cat(score_maps, 0), dim=0)
+
+            # apply gaussian smoothing on the score map
+            score_map = gaussian_filter(score_map.squeeze().cpu().detach().numpy(), sigma=4)
+            score_map_list.append(score_map)
+
+        flatten_gt_mask_list = np.concatenate(gt_mask_list).ravel()
+        flatten_score_map_list = np.concatenate(score_map_list).ravel()
+
+        # calculate per-pixel level ROCAUC
+        fpr, tpr, _ = roc_curve(flatten_gt_mask_list, flatten_score_map_list)
+        per_pixel_rocauc = roc_auc_score(flatten_gt_mask_list, flatten_score_map_list)
+        total_pixel_roc_auc.append(per_pixel_rocauc)
+        print('%s pixel ROCAUC: %.3f' % (class_name, per_pixel_rocauc))
+        fig_pixel_rocauc.plot(fpr, tpr, label='%s ROCAUC: %.3f' % (class_name, per_pixel_rocauc))
+
+        # get optimal threshold
+        precision, recall, thresholds = precision_recall_curve(flatten_gt_mask_list, flatten_score_map_list)
+        a = 2 * precision * recall
+        b = precision + recall
+        f1 = np.divide(a, b, out=np.zeros_like(a), where=b != 0)
+        threshold = thresholds[np.argmax(f1)]
+
+        # visualize localization result
+        visualize_loc_result(test_imgs, gt_mask_list, score_map_list, threshold, args.save_path, class_name, vis_num=5)
+
+    print('Average ROCAUC: %.3f' % np.mean(total_roc_auc))
+    fig_img_rocauc.title.set_text('Average image ROCAUC: %.3f' % np.mean(total_roc_auc))
+    fig_img_rocauc.legend(loc="lower right")
+
+    print('Average pixel ROCUAC: %.3f' % np.mean(total_pixel_roc_auc))
+    fig_pixel_rocauc.title.set_text('Average pixel ROCAUC: %.3f' % np.mean(total_pixel_roc_auc))
+    fig_pixel_rocauc.legend(loc="lower right")
+
+    fig.tight_layout()
+    fig.savefig(os.path.join(args.save_path, 'roc_curve.png'), dpi=100)
+
+
+def calc_dist_matrix(x, y):
+    """Calculate Euclidean distance matrix with torch.tensor"""
+    n = x.size(0)
+    m = y.size(0)
+    d = x.size(1)
+    x = x.unsqueeze(1).expand(n, m, d)
+    y = y.unsqueeze(0).expand(n, m, d)
+    dist_matrix = torch.sqrt(torch.pow(x - y, 2).sum(2))
+    return dist_matrix
+
+
+def visualize_loc_result(test_imgs, gt_mask_list, score_map_list, threshold,
+                         save_path, class_name, vis_num=5):
+
+    for t_idx in range(vis_num):
+        test_img = test_imgs[t_idx]
+        test_img = denormalization(test_img)
+        test_gt = gt_mask_list[t_idx].transpose(1, 2, 0).squeeze()
+        test_pred = score_map_list[t_idx]
+        test_pred[test_pred <= threshold] = 0
+        test_pred[test_pred > threshold] = 1
+        test_pred_img = test_img.copy()
+        test_pred_img[test_pred == 0] = 0
+
+        fig_img, ax_img = plt.subplots(1, 4, figsize=(12, 4))
+        fig_img.subplots_adjust(left=0, right=1, bottom=0, top=1)
+
+        for ax_i in ax_img:
+            ax_i.axes.xaxis.set_visible(False)
+            ax_i.axes.yaxis.set_visible(False)
+
+        ax_img[0].imshow(test_img)
+        ax_img[0].title.set_text('Image')
+        ax_img[1].imshow(test_gt, cmap='gray')
+        ax_img[1].title.set_text('GroundTruth')
+        ax_img[2].imshow(test_pred, cmap='gray')
+        ax_img[2].title.set_text('Predicted mask')
+        ax_img[3].imshow(test_pred_img)
+        ax_img[3].title.set_text('Predicted anomalous image')
+
+        os.makedirs(os.path.join(save_path, 'images'), exist_ok=True)
+        fig_img.savefig(os.path.join(save_path, 'images', '%s_%03d.png' % (class_name, t_idx)), dpi=100)
+        fig_img.clf()
+        plt.close(fig_img)
+
+
+def denormalization(x):
+    mean = np.array([0.485, 0.456, 0.406])
+    std = np.array([0.229, 0.224, 0.225])
+    x = (((x.transpose(1, 2, 0) * std) + mean) * 255.).astype(np.uint8)
+    return x
+
+def load_images_by_positions(dataset_root, part, positions=None, modality="rgb"):
+    """
+    Carica le immagini buone e difettose per ciascuna posizione.
+    Restituisce un dizionario: {posizione: {'good': [img], 'defect': [img]}}
+    """
+    images_by_pos = {}
+    if positions is None:
+        positions = [f"pos{i+1}" for i in range(8)]
+    for pos in positions:
+        good, defect = mvtec.list_images_by_part(dataset_root, part, [pos], modality)
+        images_by_pos[pos] = {'good': good, 'defect': defect}
+    return images_by_pos
+
+def concat_images(images_by_pos, key='good'):
+    """
+    Concatena tutte le immagini buone (o difettose) da tutte le posizioni.
+    """
+    all_imgs = []
+    for pos in images_by_pos:
+        all_imgs.extend(images_by_pos[pos][key])
+    return all_imgs
+
+if __name__ == '__main__':
     main()

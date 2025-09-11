@@ -3,7 +3,7 @@ from typing import Iterable, List, Tuple
 
 IMG_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
 
-def _iter_imgs(root: Path) -> Iterable[Path]:
+def _iter_imgs(root: Path):
     if not root.exists():
         return []
     return (p for p in root.rglob("*") if p.suffix.lower() in IMG_EXTS)
