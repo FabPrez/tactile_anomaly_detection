@@ -9,6 +9,10 @@ from sklearn.metrics import roc_curve
 from sklearn.metrics import precision_recall_curve
 from scipy.ndimage import gaussian_filter
 import matplotlib.pyplot as plt
+import cv2  # aggiunto import
+
+import sys
+sys.path.append(os.path.join(os.path.dirname(__file__), 'datasets'))
 
 import torch
 import torch.nn.functional as F
@@ -78,7 +82,7 @@ def main():
                 # initialize hook outputs
                 outputs = []
             for k, v in train_outputs.items():
-                train_outputs[k] = torch.cat(v, 0)
+             train_outputs[k] = torch.cat(v, 0)
             # save extracted feature
             with open(train_feature_filepath, 'wb') as f:
                 pickle.dump(train_outputs, f)
@@ -197,12 +201,14 @@ def calc_dist_matrix(x, y):
 
 def visualize_loc_result(test_imgs, gt_mask_list, score_map_list, threshold,
                          save_path, class_name, vis_num=5):
-
     for t_idx in range(vis_num):
         test_img = test_imgs[t_idx]
         test_img = denormalization(test_img)
-        test_gt = gt_mask_list[t_idx].transpose(1, 2, 0).squeeze()
+        test_gt = gt_mask_list[t_idx].squeeze()
         test_pred = score_map_list[t_idx]
+        # Ridimensiona la maschera predetta alla dimensione dell'immagine
+        if test_pred.shape != test_img.shape[:2]:
+            test_pred = cv2.resize(test_pred, (test_img.shape[1], test_img.shape[0]), interpolation=cv2.INTER_NEAREST)
         test_pred[test_pred <= threshold] = 0
         test_pred[test_pred > threshold] = 1
         test_pred_img = test_img.copy()
