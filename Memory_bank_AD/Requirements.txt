@@ -1,5 +1,12 @@
 torch 
 torchvision
 scikit-learn
+scikit-learn
 matplotlib
 tdqm
+numpy
+pandas
+Pillow
+tqdm
+opencv-python
+opencv-contrib-python

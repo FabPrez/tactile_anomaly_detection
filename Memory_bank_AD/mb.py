@@ -9,7 +9,7 @@ from sklearn.metrics import roc_curve
 from sklearn.metrics import precision_recall_curve
 from scipy.ndimage import gaussian_filter
 import matplotlib.pyplot as plt
-import cv2  # aggiunto import
+# import cv2  # aggiunto import
 
 import sys
 sys.path.append(os.path.join(os.path.dirname(__file__), 'datasets'))
@@ -20,6 +20,12 @@ from torch.utils.data import DataLoader
 from torchvision.models import wide_resnet50_2
 
 import datasets.mvtec as mvtec
+
+# Scegli il metodo di preprocessing che vuoi usare:
+from preprocessing.resize import preprocess
+# from preprocessing.center_crop import preprocess
+# from preprocessing.patch import preprocess
+# from preprocessing.pad import preprocess
 
 
 def parse_args():
