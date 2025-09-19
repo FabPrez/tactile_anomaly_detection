@@ -1,4 +1,5 @@
-torch
+torch 
 torchvision
-sklearn
+scikit-learn
 matplotlib
+tdqm
