@@ -30,6 +30,8 @@ POSITION    = "pos1"    # oppure "all"
 TOP_K       = 5
 IMG_SIZE    = 224       # input ResNet
 SEED        = 42
+P_PIX       = 99.0      # percentile per soglia pixel-level
+GAUSSIAN_SIGMA = 4      # sigma per filtro gaussiano
 # ------------------------------------------
 
 
@@ -256,79 +258,68 @@ def main():
             score_map = F.interpolate(score_map.unsqueeze(0).unsqueeze(0), size=224,
                                         mode='bilinear', align_corners=False)
             score_maps.append(score_map)
-
         # average distance between the features
         score_map = torch.mean(torch.cat(score_maps, 0), dim=0)
-
         # apply gaussian smoothing on the score map
-        score_map = gaussian_filter(score_map.squeeze().cpu().detach().numpy(), sigma=4)
+        score_map = gaussian_filter(score_map.squeeze().cpu().detach().numpy(), sigma=GAUSSIAN_SIGMA)
         score_map_list.append(score_map)
 
-    # flatten_gt_mask_list = np.concatenate(gt_mask_list).ravel()
-    flatten_score_map_list = np.concatenate(score_map_list).ravel()
-    
-    # 1) Scegli il percentile (tipicamente 97.5, 99, 99.5)
-    P_PIX = 99.0
+    # --- NORMALIZZAZIONE score map GLOBALE (solo sulle good) ---
+    # 1. Calcola min e max globali sulle score map delle sole immagini good
+    good_maps = [sm for sm, y in zip(score_map_list, gt_np) if y == 0]
+    if len(good_maps) == 0:
+        good_maps = score_map_list  # fallback: tutte
+    global_min = np.min([sm.min() for sm in good_maps])
+    global_max = np.max([sm.max() for sm in good_maps])
 
-    # 2) Costruisci il "pool" di pixel SOLO dalle mappe delle immagini good.
-    #    (normalizziamo ogni mappa in [0,1] prima di raccogliere i pixel ⇒ soglia più stabile)
-    pix_good = []
-    for sm, y in zip(score_map_list, gt_np):
-        if y == 0:  # good
-            mmin, mmax = sm.min(), sm.max()
-            sm_n = (sm - mmin) / (mmax - mmin + 1e-8)
-            pix_good.append(sm_n.ravel())
-
-    if len(pix_good) == 0:
-        # fallback molto conservativo se (per qualche motivo) non ci sono good in validation
-        # usa tutte le mappe (normalizzate) per stimare il percentile
-        pix_good = [((sm - sm.min()) / (sm.max() - sm.min() + 1e-8)).ravel() for sm in score_map_list]
-
-    pix_good = np.concatenate(pix_good)
-    thr_pix = float(np.percentile(pix_good, P_PIX))
-    print(f"[pixel-level] soglia percentile {P_PIX}% (su pixel delle immagini good) = {thr_pix:.4f}")
-
-    # 3) Applica la soglia a TUTTE le score map (normalizzate per visualizzazione)
-    masks = []
+    # 2. Normalizza tutte le score map usando questi valori globali
     maps_norm = []
     for sm in score_map_list:
-        sm_n = (sm - sm.min()) / (sm.max() - sm.min() + 1e-8)  # normalizza per la vista/overlay
+        sm_n = (sm - global_min) / (global_max - global_min + 1e-8)
         maps_norm.append(sm_n)
+
+    # 3. Calcola la soglia percentile SOLO sui pixel delle immagini good (normalizzate globalmente)
+    pix_good = []
+    for sm_n, y in zip(maps_norm, gt_np):
+        if y == 0:
+            pix_good.append(sm_n.ravel())
+    if len(pix_good) == 0:
+        pix_good = [sm_n.ravel() for sm_n in maps_norm]
+    pix_good = np.concatenate(pix_good)
+    thr_pix = float(np.percentile(pix_good, P_PIX))
+    print(f"[pixel-level] soglia percentile {P_PIX}% (su pixel delle immagini good, normalizzazione globale) = {thr_pix:.4f}")
+
+    # 4. Applica la soglia a tutte le score map normalizzate globalmente
+    masks = []
+    for sm_n in maps_norm:
         masks.append((sm_n >= thr_pix).astype(np.uint8))
 
     print(f"[pixel-level] immagini: {len(masks)} | threshold globale (percentile) = {thr_pix:.4f}")
 
-    # 4) Visualizza
+    # 5. Visualizza
     show_pixel_localization_grid(
         dataset=val_set,
         score_maps_norm=maps_norm,
         masks=masks,
         rows=2, cols=3,
         cmap_name="jet",
-        suptitle=f"Pixel localization (percentile={P_PIX}%, thr={thr_pix:.3f})"
+        suptitle=f"Pixel localization (percentile={P_PIX}%, thr={thr_pix:.3f}, global norm)"
     )
-    sassdgsdsd
-    
+
+    # --- Soglia manuale su mappe normalizzate globalmente ---
     MANUAL_TRESHOLD = 0.65
-    
-    masks, maps_norm = make_pixel_masks_manual(
-        score_map_list,
-        dataset=val_set,
-        threshold=MANUAL_TRESHOLD,
-        normalize_each=True
-    )
-    
-    print(f"[pixel-level] soglia usata: {MANUAL_TRESHOLD} | immagini: {len(masks)}")
-
+    masks_manual = []
+    for sm_n in maps_norm:
+        masks_manual.append((sm_n >= MANUAL_TRESHOLD).astype(np.uint8))
+    print(f"[pixel-level] soglia usata: {MANUAL_TRESHOLD} | immagini: {len(masks_manual)}")
     show_pixel_localization_grid(
         dataset=val_set,
         score_maps_norm=maps_norm,
-        masks=masks,
+        masks=masks_manual,
         rows=2, cols=3,
         cmap_name="jet",
-        suptitle=f"Pixel localization (thr={MANUAL_TRESHOLD})"
+        suptitle=f"Pixel localization (thr={MANUAL_TRESHOLD}, global norm)"
     )
-
     
 
 if __name__ == "__main__":

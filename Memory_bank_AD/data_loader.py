@@ -16,10 +16,11 @@ EXTS = {"rgb": {".png"}, "pointcloud": {".ply"}}
 # -------- util --------
 
 def _iter_files(root: Path, exts: set[str]) -> List[Path]:
-    """Ritorna i file con estensioni valide sotto root (ricorsivo)."""
+    """Ritorna i file con estensioni valide sotto root (ricorsivo, case-insensitive)."""
     if not root.exists():
         return []
-    return sorted(p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in exts)
+    exts_lower = {e.lower() for e in exts}
+    return sorted(p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in exts_lower)
 
 def list_positions(part: str) -> List[str]:
     """Ritorna la lista delle posizioni disponibili (es. ['pos1','pos2',...])."""
