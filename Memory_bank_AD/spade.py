@@ -21,7 +21,7 @@ from sklearn.metrics import roc_curve, accuracy_score, confusion_matrix
 
 # miei pacchetti
 from data_loader import get_items, save_split_pickle, load_split_pickle
-from view_utils import show_dataset_images, show_validation_grid_from_loader, make_pixel_masks_manual, show_pixel_localization_grid
+from view_utils import show_dataset_images, show_validation_grid_from_loader
 
 
 # ----------------- CONFIG -----------------
@@ -60,35 +60,72 @@ def get_val_image_by_global_idx(val_loader, global_idx):
 
 # ---------- dataset ----------
 class MyDataset(Dataset):
-    def __init__(self, images, label_type: str, transform=None):
-        """
-        images: Sequence[PIL.Image.Image] (RGB)
-        label_type: "good" -> 0, "fault" -> 1 (tutte uguali)
-        transform: pre-process PIL→PIL (es. CenterCrop), **senza** ToTensor
-        """
+    def __init__(self,
+                 images,                     # Sequence[PIL.Image.Image] (RGB)
+                 label_type: str,            # "good" -> 0, "fault" -> 1
+                 transform=None,             # es. transforms.CenterCrop(IMG_SIZE)
+                 masks=None                  # opzionale: Sequence[mask] (np.ndarray HxW o PIL), oppure None
+                 ):
         assert label_type in {"good", "fault"}, "label_type deve essere 'good' o 'fault'"
-        label_value = 0 if label_type == "good" else 1
+        self.label_value = 0 if label_type == "good" else 1
+        self.transform = transform
 
-        self.data = []
-        for img_pil in images:
+        # normalizza la lista maschere alla stessa lunghezza delle immagini
+        if masks is None:
+            masks = [None] * len(images)
+        else:
+            assert len(masks) == len(images), "masks deve avere stessa lunghezza di images"
+
+        imgs_t, masks_t = [], []
+
+        for img_pil, mk in zip(images, masks):
+            # --- immagine ---
             assert isinstance(img_pil, Image.Image), "Le immagini devono essere PIL.Image"
             if transform is not None:
-                img_pil = transform(img_pil)  # ancora PIL
-            # PIL → Tensor (C,H,W) float32 in [0,1]
-            img_t = torch.tensor(np.array(img_pil), dtype=torch.float32).permute(2, 0, 1) / 255.0
-            self.data.append(img_t)
+                img_pil = transform(img_pil)       # ancora PIL
+            img_np = np.array(img_pil)             # (H,W,C) uint8
+            img_t = torch.tensor(img_np, dtype=torch.float32).permute(2, 0, 1) / 255.0  # (C,H,W) in [0,1]
+            H, W = img_t.shape[1], img_t.shape[2]
 
-        self.data   = torch.stack(self.data)  # (N, C, H, W)
-        self.labels = torch.full((len(self.data),), fill_value=label_value, dtype=torch.long)
+            # --- maschera ---
+            if mk is None:                          # good o mask mancante → tutta zero
+                mk_np = np.zeros((H, W), dtype=np.uint8)
+            else:
+                if isinstance(mk, Image.Image):
+                    mk_pil = mk.convert("L")
+                else:
+                    # np.ndarray
+                    mk_np0 = np.array(mk)           # può essere 0/1 o 0..255
+                    mk_pil = Image.fromarray(mk_np0.astype(np.uint8), mode="L")
+                # applica stesso transform geometrico (CenterCrop non interpola)
+                if transform is not None:
+                    mk_pil = transform(mk_pil)
+                mk_np = np.array(mk_pil, dtype=np.uint8)
+                # binarizza robustamente
+                mk_np = (mk_np > 0).astype(np.uint8)
+                # assicura stessa HxW dell'immagine
+                if mk_np.shape != (H, W):
+                    # fallback, dovrebbe raramente servire con stesso transform
+                    mk_pil = Image.fromarray(mk_np, mode="L").resize((W, H), resample=Image.NEAREST)
+                    mk_np = np.array(mk_pil, dtype=np.uint8)
 
-        print('data shape', self.data.shape)
+            imgs_t.append(img_t)
+            masks_t.append(torch.from_numpy(mk_np))    # (H,W) uint8 {0,1}
+
+        self.data   = torch.stack(imgs_t)                                # (N, C, H, W)
+        self.labels = torch.full((len(self.data),), self.label_value, dtype=torch.long)  # (N,)
+        self.masks  = torch.stack(masks_t)                                # (N, H, W) uint8 {0,1}
+
+        print('data shape ', self.data.shape)
         print('label shape', self.labels.shape)
+        print('mask shape ', self.masks.shape)
 
     def __getitem__(self, idx):
-        return self.data[idx], self.labels[idx]
+        return self.data[idx], self.labels[idx], self.masks[idx]
 
     def __len__(self):
         return len(self.data)
+
 
 
 def main():
@@ -96,20 +133,23 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("**device found:", device)
 
-    # transform deterministica (ordine replicabile)
+    # transform deterministica
     pre_processing = transforms.Compose([transforms.CenterCrop(IMG_SIZE)])
 
-    # carico immagini PIL
-    good_imgs_pil  = get_items(CODICE_PEZZO, modality="rgb", label="good",  positions=POSITION, return_type="pil")
-    fault_imgs_pil = get_items(CODICE_PEZZO, modality="rgb", label="fault", positions=POSITION, return_type="pil")
-
-    # quick view
-    # plt.imshow(good_imgs_pil[0]); plt.axis("off"); plt.show()
-
-    # dataset
-    good_ds  = MyDataset(good_imgs_pil,  label_type='good',  transform=pre_processing)
-    fault_ds = MyDataset(fault_imgs_pil, label_type='fault', transform=pre_processing)
-
+    # ---- carico immagini + (per fault) maschere ----
+    good_imgs_pil = get_items(CODICE_PEZZO, "rgb", label="good", positions=POSITION, return_type="pil")
+    
+    fault_imgs_pil, fault_masks_np = get_items(
+        CODICE_PEZZO, "rgb", label="fault", positions=POSITION,
+        return_type="pil",
+        with_masks=True, mask_return_type="numpy", mask_binarize=True,  # binarie 0/1
+        mask_align="order" 
+    )
+    
+    # ---- dataset ----
+    good_ds  = MyDataset(good_imgs_pil,  label_type='good',  transform=pre_processing, masks=None)
+    fault_ds = MyDataset(fault_imgs_pil, label_type='fault', transform=pre_processing, masks=fault_masks_np)
+    
     # split: train (solo good), val (k good + tutte fault)
     n_good, n_fault = len(good_ds), len(fault_ds)
     k = min(n_fault, n_good)
@@ -127,7 +167,7 @@ def main():
     val_fault_set = Subset(fault_ds, val_fault_idx)
     val_set       = ConcatDataset([val_good_set, val_fault_set])
     
-    # show_dataset_images(val_set, batch_size=5)
+    # show_dataset_images(val_set, batch_size=5, show_mask=True)
 
     print(f"Train: {len(train_set)} good")
     print(f"Val:   {len(val_good_set)} good + {len(val_fault_set)} fault = {len(val_set)}")
@@ -170,6 +210,15 @@ def main():
         for k in train_outputs:
             train_outputs[k] = torch.cat(train_outputs[k], dim=0)
         save_split_pickle(train_outputs, CODICE_PEZZO, POSITION, split="train")
+    
+    # ci aspettiamo una struttura così di train_outputs:
+    # {
+    #     'layer1': Tensor (N, C1, H1, W1),
+    #     'layer2': Tensor (N, C2, H2, W2),
+    #     'layer3': Tensor (N, C3, H3, W3),
+    #     'avgpool': Tensor (N, 2048, 1, 1),
+    # }
+    # dove N è il numero di immagini. Mentre AVGPOOL è l'ultimo strato della resnet in questione, questo va ad utilizzare 2048 numeri per descrivere l'intera feature map, mediando sui canali
 
     # ====== VAL FEATURES (cache) ======
     try:
@@ -202,11 +251,18 @@ def main():
     dist_matrix = calc_dist_matrix(
         torch.flatten(test_outputs['avgpool'], 1),    # (N_test, D)
         torch.flatten(train_outputs['avgpool'], 1))   # (N_train, D)
+    
+    # vado a calcolare la distanza euclidea considerenado un immagine fatta da 2048 numeri
 
     topk_values, topk_indexes = torch.topk(dist_matrix, k=TOP_K, dim=1, largest=False)
     scores = torch.mean(topk_values, dim=1).cpu().numpy()  # (N_test,)
+    
+    # lo score quindi, è la media delle distanze tra le immagini vicine.
 
     # selezione soglia per accuracy massima (usa solo gt image-level)
+    # Supponi 5 score: [0.9, 0.8, 0.6, 0.3, 0.1] e vere etichette [1,1,0,0,0]. Come indici hai True Positive, Fale positive ec...
+    # Abbassando la soglia (0.95→0.85→0.65→0.25→0.05) aumentano i positivi predetti: per ogni soglia ricalcoli TP, FP, TPR e FPR; collegando i punti ottieni la ROC.
+    
     fpr, tpr, thresholds = roc_curve(gt_np, scores)
     accs = []
     for th in thresholds:
@@ -231,7 +287,25 @@ def main():
     print(f"[check] len(val_loader.dataset) = {len(val_loader.dataset)}")
     print(f"[check] len(scores)             = {len(scores)}")
 
-    show_validation_grid_from_loader(val_loader.dataset, scores, preds, best_thr, per_page, cols)
+    # show_validation_grid_from_loader(val_loader.dataset, scores, preds, best_thr, per_page, cols)
+    # show_validation_grid_from_loader(
+    #     val_loader, scores, preds,
+    #     per_page=2,
+    #     show_mask=True,
+    #     show_mask_product=True,
+    #     overlay=True,           # se vuoi vedere anche l’overlay della mask
+    #     overlay_alpha=0.45
+    # )
+    
+    show_validation_grid_from_loader(
+        val_loader, scores, preds,
+        per_page=4, samples_per_row=2,
+        show_mask=True, show_mask_product=True,
+        overlay=True, overlay_alpha=0.45
+    )
+
+    asdfasfas
+
 
     # -------------- pixel level anomaly -----------------------------    
     score_map_list = []
@@ -298,36 +372,35 @@ def main():
 
     print(f"[pixel-level] immagini: {len(masks)} | threshold globale (percentile) = {thr_pix:.4f}")
 
-    # 4) Visualizza
-    show_pixel_localization_grid(
-        dataset=val_set,
-        score_maps_norm=maps_norm,
-        masks=masks,
-        rows=2, cols=3,
-        cmap_name="jet",
-        suptitle=f"Pixel localization (percentile={P_PIX}%, thr={thr_pix:.3f})"
-    )
-    sassdgsdsd
+    # # 4) Visualizza
+    # show_pixel_localization_grid(
+    #     dataset=val_set,
+    #     score_maps_norm=maps_norm,
+    #     masks=masks,
+    #     rows=2, cols=3,
+    #     cmap_name="jet",
+    #     suptitle=f"Pixel localization (percentile={P_PIX}%, thr={thr_pix:.3f})"
+    # )
     
-    MANUAL_TRESHOLD = 0.65
+    # MANUAL_TRESHOLD = 0.65
     
-    masks, maps_norm = make_pixel_masks_manual(
-        score_map_list,
-        dataset=val_set,
-        threshold=MANUAL_TRESHOLD,
-        normalize_each=True
-    )
+    # masks, maps_norm = make_pixel_masks_manual(
+    #     score_map_list,
+    #     dataset=val_set,
+    #     threshold=MANUAL_TRESHOLD,
+    #     normalize_each=True
+    # )
     
-    print(f"[pixel-level] soglia usata: {MANUAL_TRESHOLD} | immagini: {len(masks)}")
+    # print(f"[pixel-level] soglia usata: {MANUAL_TRESHOLD} | immagini: {len(masks)}")
 
-    show_pixel_localization_grid(
-        dataset=val_set,
-        score_maps_norm=maps_norm,
-        masks=masks,
-        rows=2, cols=3,
-        cmap_name="jet",
-        suptitle=f"Pixel localization (thr={MANUAL_TRESHOLD})"
-    )
+    # show_pixel_localization_grid(
+    #     dataset=val_set,
+    #     score_maps_norm=maps_norm,
+    #     masks=masks,
+    #     rows=2, cols=3,
+    #     cmap_name="jet",
+    #     suptitle=f"Pixel localization (thr={MANUAL_TRESHOLD})"
+    # )
 
     
 
