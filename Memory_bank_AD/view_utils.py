@@ -100,6 +100,114 @@ def show_dataset_images(
 
         plt.tight_layout()
         plt.show()
+        
+def show_heatmaps_from_loader(
+    ds_or_loader,
+    score_maps: list[np.ndarray],     # lista di mappe 2D (una per immagine)
+    scores: np.ndarray,               # array (N,) con lo score per immagine (image-level)
+    per_page: int = 12,
+    cols: int = 4,
+    *,
+    normalize_each: bool = True,
+    overlay_alpha: float = 0.45,
+    cmap: str = "jet",
+    title_fmt: str = "idx {i} | label {g} | score {s:.3f}",
+):
+    """
+    Mostra a PAGINE: per ogni immagine 3 pannelli [originale | heatmap | overlay].
+    - ds_or_loader: Dataset o DataLoader che restituisce (img, label) o (img, label, mask)
+    - score_maps : lista di mappe 2D allineate al dataset
+    - scores     : array (N,) con lo score per immagine, stesso ordine del dataset
+    - per_page   : # immagini per pagina
+    - cols       : # immagini per riga (ogni immagine occupa 3 colonne di pannelli)
+    """
+    # Wrappa in DataLoader a batch da per_page
+    if isinstance(ds_or_loader, DataLoader):
+        dataset = ds_or_loader.dataset
+    else:
+        dataset = ds_or_loader
+
+    N = len(dataset)
+    assert len(score_maps) == N, f"len(score_maps)={len(score_maps)} deve eguagliare len(dataset)={N}"
+    scores = np.asarray(scores).reshape(-1)
+    assert scores.shape[0] == N, f"len(scores)={len(scores)} deve eguagliare len(dataset)={N}"
+
+    loader = DataLoader(dataset, batch_size=per_page, shuffle=False, num_workers=0)
+
+    start_idx = 0
+    for batch in loader:
+        # batch può essere (X,Y) o (X,Y,M)
+        if len(batch) == 2:
+            X, Y = batch
+        else:
+            X, Y, _ = batch  # eventuali mask ignorate qui
+
+        B = X.size(0)
+        rows = math.ceil(B / cols)
+        total_cols = cols * 3  # 3 pannelli per immagine
+
+        fig, axes = plt.subplots(rows, total_cols, figsize=(3.2 * total_cols, 3.2 * rows))
+        if rows == 1:
+            axes = np.expand_dims(axes, 0)
+        if total_cols == 1:
+            axes = np.expand_dims(axes, 1)
+
+        for k in range(B):
+            i = start_idx + k
+            r = k // cols
+            c0 = (k % cols) * 3  # blocco da 3 pannelli
+
+            # immagine + label + score
+            img_chw = X[k]
+            img_hwc = chw_to_hwc_uint8(img_chw)
+            g = int(Y[k].item())
+            s = float(scores[i])
+
+            # heatmap -> ridimensiono all'immagine e (opzionalmente) normalizzo
+            sm = score_maps[i]
+            sm_resized = resize_map_to_image(sm, img_chw)  # (H,W)
+            sm_vis = normalize_map(sm_resized) if normalize_each else sm_resized
+
+            # pannello 1: originale
+            ax0 = axes[r, c0 + 0]
+            ax0.imshow(img_hwc); ax0.axis('off')
+            ax0.set_title(title_fmt.format(i=i, g=g, s=s), color=('green' if g == 0 else 'red'), fontsize=9)
+
+            # pannello 2: heatmap
+            ax1 = axes[r, c0 + 1]
+            ax1.imshow(sm_vis, cmap=cmap); ax1.axis('off'); ax1.set_title("heatmap", fontsize=9)
+
+            # pannello 3: overlay
+            ax2 = axes[r, c0 + 2]
+            ax2.imshow(img_hwc)
+            ax2.imshow(sm_vis, cmap=cmap, alpha=overlay_alpha)
+            ax2.axis('off'); ax2.set_title("overlay", fontsize=9)
+
+        plt.tight_layout()
+        plt.show()
+        start_idx += B
+
+
+
+def normalize_map(m: np.ndarray, eps: float = 1e-8) -> np.ndarray:
+    """
+    Normalizza una mappa 2D in [0,1].
+    """
+    mmin = float(m.min())
+    mmax = float(m.max())
+    return (m - mmin) / (mmax - mmin + eps)
+
+def resize_map_to_image(score_map: np.ndarray, img_chw: torch.Tensor) -> np.ndarray:
+    """
+    Ridimensiona la mappa 2D (h,w) alla risoluzione dell'immagine (C,H,W) usando bilinear.
+    Ritorna un array (H,W) float.
+    """
+    H, W = int(img_chw.shape[1]), int(img_chw.shape[2])
+    sm = torch.from_numpy(score_map).float()[None, None, ...]  # (1,1,h,w)
+    sm = F.interpolate(sm, size=(H, W), mode='bilinear', align_corners=False)
+    return sm.squeeze(0).squeeze(0).cpu().numpy()
+
+
 
 # def normalize_map(m: np.ndarray, eps: float = 1e-8):
 #     mmin, mmax = float(m.min()), float(m.max())
