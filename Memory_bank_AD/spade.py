@@ -17,7 +17,7 @@ from scipy.ndimage import gaussian_filter
 import math
 
 from torchvision.models import wide_resnet50_2, Wide_ResNet50_2_Weights
-from sklearn.metrics import roc_curve, accuracy_score, confusion_matrix
+from sklearn.metrics import roc_curve, accuracy_score, confusion_matrix, roc_auc_score, precision_recall_curve, precision_score, recall_score, f1_score
 
 # miei pacchetti
 from data_loader import get_items, save_split_pickle, load_split_pickle
@@ -27,11 +27,12 @@ from view_utils import show_dataset_images, show_validation_grid_from_loader, sh
 # ----------------- CONFIG -----------------
 CODICE_PEZZO = "PZ1"
 POSITION    = "pos1"    # oppure "all"
-TOP_K       = 5
+TOP_K       = 7
 IMG_SIZE    = 224       # input ResNet
 SEED        = 42
-P_PIX       = 99.0      # percentile per soglia pixel-level
-GAUSSIAN_SIGMA = 4      # sigma per filtro gaussiano
+
+VIS_VALID_DATASET = False
+GAUSSIAN_SIGMA = 2      # sigma per filtro gaussiano
 # ------------------------------------------
 
 
@@ -94,7 +95,7 @@ class MyDataset(Dataset):
             img_np = np.array(img_pil)             # (H,W,C) uint8
             img_t = torch.tensor(img_np, dtype=torch.float32).permute(2, 0, 1) / 255.0  # (C,H,W) in [0,1]
             
-            # img_t = (img_t - mean) / std # comment if you don't want to normalize
+            # img_t = (img_t - mean) / std # comment if you don't want to normalize with respect to typical resnet parameters
             
             H, W = img_t.shape[1], img_t.shape[2]
 
@@ -179,7 +180,6 @@ def main():
     val_set       = ConcatDataset([val_good_set, val_fault_set])
     
     # show_dataset_images(val_set, batch_size=5, show_mask=True)
-
     print(f"Train: {len(train_set)} good")
     print(f"Val:   {len(val_good_set)} good + {len(val_fault_set)} fault = {len(val_set)}")
 
@@ -264,90 +264,56 @@ def main():
         torch.flatten(train_outputs['avgpool'], 1))   # (N_train, D)
     
     # vado a calcolare la distanza euclidea considerenado un immagine fatta da 2048 numeri
-
     topk_values, topk_indexes = torch.topk(dist_matrix, k=TOP_K, dim=1, largest=False)
-    scores = torch.mean(topk_values, dim=1).cpu().numpy()  # (N_test,)
+    img_scores = torch.mean(topk_values, dim=1).cpu().numpy()  # (N_test,)
     
-    # lo score quindi, è la media delle distanze tra le immagini vicine.
+    fpr, tpr, thresholds = roc_curve(gt_np, img_scores)
+    auc_img = roc_auc_score(gt_np, img_scores)
+    
+    print(f"[image-level] ROC-AUC ({CODICE_PEZZO}/{POSITION}): {auc_img:.3f}")
+    
+    # find the best treshold for the classifcation according to Youden's J
+    J = tpr-fpr
+    best_idx = int(np.argmax(J))
+    best_thr = float(thresholds[best_idx])
 
-    # selezione soglia per accuracy massima (usa solo gt image-level)
-    # Supponi 5 score: [0.9, 0.8, 0.6, 0.3, 0.1] e vere etichette [1,1,0,0,0]. Come indici hai True Positive, Fale positive ec...
-    # Abbassando la soglia (0.95→0.85→0.65→0.25→0.05) aumentano i positivi predetti: per ogni soglia ricalcoli TP, FP, TPR e FPR; collegando i punti ottieni la ROC.
-    
-    fpr, tpr, thresholds = roc_curve(gt_np, scores)
-    accs = []
-    for th in thresholds:
-        preds = (scores >= th).astype(np.int32)
-        accs.append(accuracy_score(gt_np, preds))
-    best_idx = int(np.argmax(accs))
-    best_thr = thresholds[best_idx]
-    preds    = (scores >= best_thr).astype(np.int32)
+    # Predizioni a soglia Youden
+    preds = (img_scores >= best_thr).astype(np.int32)
 
     tn, fp, fn, tp = confusion_matrix(gt_np, preds, labels=[0, 1]).ravel()
-    print(f"[image-level] threshold selezionata: {best_thr:.6f}")
-    print(f"[image-level] immagini ANOMALE predette: {int(preds.sum())} su {len(preds)}")
-    print(f"[image-level] accuracy: {accs[best_idx]*100:.2f}%")
+    print(f"[image-level] soglia (Youden) = {best_thr:.6f}")
     print(f"[image-level] CM -> TN:{tn}  FP:{fp}  FN:{fn}  TP:{tp}")
-    
+    print(f"[image-level] TPR:{fpr[best_idx]:.3f}  FPR:{tpr[best_idx]:.3f}")
 
-    # --- mostra tutte le immagini validation con il loro anomaly score ---
+    fig, ax = plt.subplots(1, 2, figsize=(20, 10))
+    fig_img_rocauc = ax[0]
+    fig_pixel_rocauc = ax[1]
+
+    fig, ax = plt.subplots(1, 2, figsize=(10, 4))
+    ax[0].plot(fpr, tpr, label=f"AUC={roc_auc_score(gt_list, img_scores):.3f}")
+    ax[0].plot([0,1],[0,1],'k--',linewidth=1)
+    ax[0].set_title("Image-level ROC"); ax[0].set_xlabel("FPR"); ax[0].set_ylabel("TPR"); ax[0].legend()
+
+    plt.tight_layout(); plt.show()
+
+    # --- SHOW IMAGES ---
     N = len(gt_np)
-    per_page = 2         # quante immagini per pagina
+    per_page = 2         
     cols = 4
     
     print(f"[check] len(val_loader.dataset) = {len(val_loader.dataset)}")
-    print(f"[check] len(scores)             = {len(scores)}")
+    print(f"[check] len(scores)             = {len(img_scores)}")
 
-    # show_validation_grid_from_loader(val_loader.dataset, scores, preds, best_thr, per_page, cols)
-    # show_validation_grid_from_loader(
-    #     val_loader, scores, preds,
-    #     per_page=2,
-    #     show_mask=True,
-    #     show_mask_product=True,
-    #     overlay=True,           # se vuoi vedere anche l’overlay della mask
-    #     overlay_alpha=0.45
-    # )
+    if VIS_VALID_DATASET:
+        show_validation_grid_from_loader(
+            val_loader, img_scores, preds,
+            per_page=4, samples_per_row=2,
+            show_mask=True, show_mask_product=True,
+            overlay=True, overlay_alpha=0.45
+        )
+
     
-    # show_validation_grid_from_loader(
-    #     val_loader, scores, preds,
-    #     per_page=4, samples_per_row=2,
-    #     show_mask=True, show_mask_product=True,
-    #     overlay=True, overlay_alpha=0.45
-    # )
-
-    # -------------- pixel level anomaly -----------------------------    
-    # score_map_list = []
-    # for t_idx in tqdm(range(test_outputs['avgpool'].shape[0]), '| localization | test | %s |' % CODICE_PEZZO):
-    #     score_maps = []
-    #     for layer_name in ['layer1', 'layer2', 'layer3']:  # for each layer
-
-    #         # construct a gallery of features at all pixel locations of the K nearest neighbors
-    #         topk_feat_map = train_outputs[layer_name][topk_indexes[t_idx]]
-    #         test_feat_map = test_outputs[layer_name][t_idx:t_idx + 1]
-            
-    #         # topk_feat_map = l2norm(topk_feat_map, dim=1)
-    #         # test_feat_map = l2norm(test_feat_map, dim=1)
-            
-    #         feat_gallery = topk_feat_map.transpose(3, 1).flatten(0, 2).unsqueeze(-1).unsqueeze(-1)
-
-    #         # calculate distance matrix
-    #         dist_matrix_list = []
-    #         for d_idx in range(feat_gallery.shape[0] // 100):
-    #             dist_matrix = torch.pairwise_distance(feat_gallery[d_idx * 100:d_idx * 100 + 100], test_feat_map)
-    #             dist_matrix_list.append(dist_matrix)
-    #         dist_matrix = torch.cat(dist_matrix_list, 0)
-
-    #         # k nearest features from the gallery (k=1)
-    #         score_map = torch.min(dist_matrix, dim=0)[0]
-    #         score_map = F.interpolate(score_map.unsqueeze(0).unsqueeze(0), size=224,
-    #                                     mode='bilinear', align_corners=False)
-    #         score_maps.append(score_map)
-    #     # average distance between the features
-    #     score_map = torch.mean(torch.cat(score_maps, 0), dim=0)
-    #     # apply gaussian smoothing on the score map
-    #     score_map = gaussian_filter(score_map.squeeze().cpu().detach().numpy(), sigma=GAUSSIAN_SIGMA)
-    #     score_map_list.append(score_map)
-        
+    # ---- PIXEL LEVEL FEATURES --------------------------
     score_map_list = []
     for t_idx in tqdm(range(test_outputs['avgpool'].shape[0]), '| localization | test | %s |' % CODICE_PEZZO):
         per_layer_maps = []
@@ -360,8 +326,8 @@ def main():
             test_feat = test_outputs[layer_name][t_idx:t_idx + 1].to(device)        # (1,C,H,W)
 
             # L2-norm sul canale → distanza cosine-like più stabile
-            # topk_feat = l2norm(topk_feat, dim=1)
-            # test_feat = l2norm(test_feat, dim=1)
+            topk_feat = l2norm(topk_feat, dim=1)
+            test_feat = l2norm(test_feat, dim=1)
 
             K_, C, H, W = topk_feat.shape
 
@@ -389,13 +355,65 @@ def main():
         if GAUSSIAN_SIGMA > 0:
             score_map = gaussian_filter(score_map, sigma=GAUSSIAN_SIGMA)
         score_map_list.append(score_map)
-
         
- 
+    gt_pix = []
+    loader_masks = DataLoader(val_set, batch_size=32, shuffle=False, num_workers=0)
+    for _, _, m in loader_masks:                 # m: (B,H,W) uint8 {0,1}
+        gt_pix.append(m.numpy().reshape(m.size(0), -1))  # (B, H*W)
+    gt_pix = np.concatenate(gt_pix, axis=0).ravel().astype(np.uint8)  # (N_tot_pixel,)
+
+    # --- 2) allinea e flattena le score map ---
+    # score_map_list: lista di array (H,W) float (più alto = più anomalo)
+    pred_pix = np.concatenate([sm.reshape(-1) for sm in score_map_list], axis=0)  # (N_tot_pixel,)
+
+    # (facoltativo: assicurati che lunghezze combacino)
+    assert gt_pix.shape[0] == pred_pix.shape[0], f"Pixels mismatch: gt {gt_pix.shape[0]} vs pred {pred_pix.shape[0]}"
+
+    # --- 3) ROC & AUROC per-pixel ---
+    fpr_pix, tpr_pix, thr_roc = roc_curve(gt_pix, pred_pix)
+    auc_pix = roc_auc_score(gt_pix, pred_pix)
+    print(f"[pixel-level] AUROC = {auc_pix:.3f}")
+
+    plt.plot(fpr_pix, tpr_pix, label=f"AUC={auc_pix:.3f}")
+    plt.plot([0,1],[0,1],'k--',linewidth=1)
+    plt.xlabel("FPR"); plt.ylabel("TPR")
+    plt.title("Pixel-level ROC")
+    plt.legend(loc="lower right")
+    plt.tight_layout()
+    plt.show()
+
+    J = tpr_pix - fpr_pix                         #TODO: vedere cosa è Youden's J statistic
+    best_idx_roc = int(np.argmax(J))
+    best_thr_roc = float(thr_roc[best_idx_roc])
+    print(f"[pixel-level] Best threshold (ROC/Youden): {best_thr_roc:.6f}  | TPR={tpr_pix[best_idx_roc]:.3f}  FPR={fpr_pix[best_idx_roc]:.3f}")
+
+    # ----------------------------
+    # 2) THRESHOLD da PR (F1 max)
+    # ----------------------------
+    prec, rec, thr_pr = precision_recall_curve(gt_pix, pred_pix)
+    # NB: thr_pr ha len = len(prec)-1 = len(rec)-1
+    f1_vals = 2 * prec[:-1] * rec[:-1] / (prec[:-1] + rec[:-1] + 1e-12)
+    best_idx_pr = int(np.argmax(f1_vals))
+    best_thr_pr = float(thr_pr[best_idx_pr])
+    print(f"[pixel-level] Best threshold (PR/F1):    {best_thr_pr:.6f}  | P={prec[best_idx_pr]:.3f}  R={rec[best_idx_pr]:.3f}  F1={f1_vals[best_idx_pr]:.3f}")
+
+    # ------------------------------------------
+    # 3) Applica le due soglie alle score map 2D
+    #    (score_map_list è la lista delle mappe (H,W))
+    # ------------------------------------------
+    masks_roc = [(sm >= best_thr_roc).astype(np.uint8) for sm in score_map_list]
+    masks_pr  = [(sm >= best_thr_pr ).astype(np.uint8) for sm in score_map_list]
+    acc_r, p_r, r_r, f1_r = eval_pixel_metrics(masks_roc, val_set)
+    acc_p, p_p, r_p, f1_p = eval_pixel_metrics(masks_pr,  val_set)
+
+    print(f"[pixel-level] ROC thr -> Acc={acc_r:.3f}  P={p_r:.3f}  R={r_r:.3f}  F1={f1_r:.3f}")
+    print(f"[pixel-level]  PR thr -> Acc={acc_p:.3f}  P={p_p:.3f}  R={r_p:.3f}  F1={f1_p:.3f}")
+    
+    
     show_heatmaps_from_loader(
         ds_or_loader=val_loader.dataset,   # o val_set
-        score_maps=score_map_list,         # create prima
-        scores=scores,                     # i tuoi image-level scores (N,)
+        score_maps=masks_roc,       
+        scores=img_scores,                     # i tuoi image-level scores (N,)
         per_page=6,
         cols=3,
         normalize_each=False,
@@ -404,82 +422,25 @@ def main():
         title_fmt="idx {i} | label {g} | score {s:.3f}",
     )
 
-    # --- NORMALIZZAZIONE score map GLOBALE (solo sulle good) ---
-    # 1. Calcola min e max globali sulle score map delle sole immagini good
-    # good_maps = [sm for sm, y in zip(score_map_list, gt_np) if y == 0]
-    # if len(good_maps) == 0:
-    #     good_maps = score_map_list  # fallback: tutte
-    # global_min = np.min([sm.min() for sm in good_maps])
-    # global_max = np.max([sm.max() for sm in good_maps])
+ 
+# Se vuoi valutare le metriche pixel-level su tutto il validation set:
+def eval_pixel_metrics(masks_bin_list, gt_dataset):
+    # flatten pred
+    pred_flat = np.concatenate([m.reshape(-1) for m in masks_bin_list], axis=0).astype(np.uint8)
+    # flatten gt (già lo hai come gt_pix, ma ricalcoliamo per completezza)
+    gt_flat = []
+    loader_masks = DataLoader(gt_dataset, batch_size=32, shuffle=False, num_workers=0)
+    for _, _, m in loader_masks:                      # m: (B,H,W) uint8 {0,1}
+        gt_flat.append(m.numpy().reshape(m.size(0), -1))
+    gt_flat = np.concatenate(gt_flat, axis=0).ravel().astype(np.uint8)
 
-    # # 2. Normalizza tutte le score map usando questi valori globali
-    # maps_norm = []
-    # for sm in score_map_list:
-    #     sm_n = (sm - global_min) / (global_max - global_min + 1e-8)
-    #     maps_norm.append(sm_n)
-
-    # # 3. Calcola la soglia percentile SOLO sui pixel delle immagini good (normalizzate globalmente)
-    # pix_good = []
-    # for sm_n, y in zip(maps_norm, gt_np):
-    #     if y == 0:
-    #         pix_good.append(sm_n.ravel())
-    # if len(pix_good) == 0:
-    #     pix_good = [sm_n.ravel() for sm_n in maps_norm]
-    # pix_good = np.concatenate(pix_good)
-    # thr_pix = float(np.percentile(pix_good, P_PIX))
-    # print(f"[pixel-level] soglia percentile {P_PIX}% (su pixel delle immagini good, normalizzazione globale) = {thr_pix:.4f}")
-
-    # # 4. Applica la soglia a tutte le score map normalizzate globalmente
-    # masks = []
-    # for sm_n in maps_norm:
-    #     masks.append((sm_n >= thr_pix).astype(np.uint8))
-
-    # print(f"[pixel-level] immagini: {len(masks)} | threshold globale (percentile) = {thr_pix:.4f}")
-
-    # # 4) Visualizza
-    # show_pixel_localization_grid(
-    #     dataset=val_set,
-    #     score_maps_norm=maps_norm,
-    #     masks=masks,
-    #     rows=2, cols=3,
-    #     cmap_name="jet",
-    #     suptitle=f"Pixel localization (percentile={P_PIX}%, thr={thr_pix:.3f})"
-    # )
-    
-    # MANUAL_TRESHOLD = 0.65
-    
-    # masks, maps_norm = make_pixel_masks_manual(
-    #     score_map_list,
-    #     dataset=val_set,
-    #     threshold=MANUAL_TRESHOLD,
-    #     normalize_each=True
-    # )
-    
-    # print(f"[pixel-level] soglia usata: {MANUAL_TRESHOLD} | immagini: {len(masks)}")
-
-    # show_pixel_localization_grid(
-    #     dataset=val_set,
-    #     score_maps_norm=maps_norm,
-    #     masks=masks,
-    #     rows=2, cols=3,
-    #     cmap_name="jet",
-    #     suptitle=f"Pixel localization (thr={MANUAL_TRESHOLD})"
-    # )
-
-    
+    assert gt_flat.shape[0] == pred_flat.shape[0], "Mismatch gt vs pred pixel."
+    acc = accuracy_score(gt_flat, pred_flat)
+    p   = precision_score(gt_flat, pred_flat, zero_division=0)
+    r   = recall_score(gt_flat, pred_flat,    zero_division=0)
+    f1  = f1_score(gt_flat, pred_flat,        zero_division=0)
+    return acc, p, r, f1
 
 if __name__ == "__main__":
     main()
-   # show_heatmaps_from_loader(
-    #     val_loader,            # o direttamente val_set
-    #     score_maps=score_map_list,
-    #     per_page=2,            # decidi tu quante per pagina
-    #     overlay_alpha=0.45,
-    #     cmap="jet",
-    #     normalize_each=False,
-    #     title_with_label=True,
-    #     scores=scores,         # opzionale: gli score image-level che hai calcolato
-    #     preds=preds,           # opzionale: le predizioni 0/1
-    #     threshold=best_thr     # opzionale: la soglia image-level
-    # )
     
