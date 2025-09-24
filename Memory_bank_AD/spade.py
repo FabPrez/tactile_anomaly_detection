@@ -25,6 +25,7 @@ from scipy.ndimage import label as cc_label
 # miei pacchetti
 from data_loader import get_items, save_split_pickle, load_split_pickle
 from view_utils import show_dataset_images, show_validation_grid_from_loader, show_heatmaps_from_loader
+from ad_analysis import run_pixel_level_evaluation, print_pixel_report
 
 
 # ----------------- CONFIG -----------------
@@ -55,109 +56,6 @@ def calc_dist_matrix(x, y):
 def l2norm(x, dim=1, eps=1e-6):
     """Normalizzazione L2 lungo la dimensione 'dim' (cosine-like distance)."""
     return x / (x.norm(dim=dim, keepdim=True) + eps)
-
-def get_val_image_by_global_idx(val_loader, global_idx):
-    """
-    Ritorna l'immagine (CHW in [0,1]) del global_idx percorrendo val_loader in ordine.
-    Richiede shuffle=False e stesse transform usate per le feature.
-    """
-    seen = 0
-    for x, _ in val_loader:
-        b = x.size(0)
-        if seen + b > global_idx:
-            return x[global_idx - seen].cpu().numpy()
-        seen += b
-    raise IndexError(f"indices out of range: {global_idx}, tot={seen}")
-
-
-# >>> NEW: funzioni per PRO
-def _compute_fpr_and_region_overlaps(pred_bin_list, gt_list):
-    """
-    pred_bin_list: lista di array binari (H,W) predetti (0/1)
-    gt_list:      lista di array binari (H,W) GT (0/1)
-    Ritorna:
-      fpr_scalar: FP / (FP+TN) aggregato su tutte le immagini
-      overlaps:   lista di overlap per ciascuna regione connessa di GT (|P∩G|/|G|)
-    """
-    assert len(pred_bin_list) == len(gt_list)
-    FP = 0
-    TN = 0
-    overlaps = []
-
-    for pred, gt in zip(pred_bin_list, gt_list):
-        # FPR globale sugli sfondi (gt==0)
-        bg = (gt == 0)
-        FP += np.logical_and(pred == 1, bg).sum()
-        TN += np.logical_and(pred == 0, bg).sum()
-
-        # PRO: per-region overlap sulle componenti connesse delle regioni GT
-        if (gt > 0).any():
-            lbl, ncomp = cc_label(gt.astype(np.uint8))
-            for k in range(1, ncomp + 1):
-                region = (lbl == k)
-                denom = region.sum()
-                if denom > 0:
-                    num = np.logical_and(pred == 1, region).sum()
-                    overlaps.append(num / float(denom))
-
-    fpr = FP / float(FP + TN + 1e-12)
-    return fpr, overlaps
-
-
-def compute_pro_curve(score_map_list, gt_mask_list, num_thrs=200, fpr_limit=0.3):
-    """
-    Calcola curva PRO (media overlap per regione GT) al variare della soglia,
-    insieme alla curva FPR; integra l'area fino a fpr_limit (default 0.3).
-    """
-    # soglie uniformi sul range dei punteggi
-    all_scores = np.concatenate([sm.reshape(-1) for sm in score_map_list], axis=0)
-    smin, smax = float(np.min(all_scores)), float(np.max(all_scores))
-    if smax <= smin + 1e-12:
-        # caso degenere: tutte le score uguali
-        thresholds = np.array([smin])
-    else:
-        thresholds = np.linspace(smin, smax, num=num_thrs, endpoint=True)
-
-    fpr_list = []
-    pro_list = []
-
-    for thr in thresholds:
-        pred_bin_list = [(sm >= thr).astype(np.uint8) for sm in score_map_list]
-        fpr, overlaps = _compute_fpr_and_region_overlaps(pred_bin_list, gt_mask_list)
-        fpr_list.append(fpr)
-        # media sugli overlap di tutte le regioni del dataset; se non ci sono regioni, PRO=0
-        pro_list.append(np.mean(overlaps) if len(overlaps) > 0 else 0.0)
-
-    fpr_arr = np.asarray(fpr_list)
-    pro_arr = np.asarray(pro_list)
-
-    # AUC fino a fpr_limit con semplice clipping + interpolazione del punto limite
-    order = np.argsort(fpr_arr)
-    fpr_arr = fpr_arr[order]
-    pro_arr = pro_arr[order]
-
-    # garantisco punto fpr=0
-    if fpr_arr[0] > 0.0:
-        pro0 = np.interp(0.0, fpr_arr, pro_arr)
-        fpr_arr = np.insert(fpr_arr, 0, 0.0)
-        pro_arr = np.insert(pro_arr, 0, pro0)
-
-    # taglio a fpr_limit e interpolo l'ultimo punto
-    if fpr_arr[-1] < fpr_limit:
-        pro_lim = np.interp(fpr_limit, fpr_arr, pro_arr)
-        fpr_clip = np.append(fpr_arr, fpr_limit)
-        pro_clip = np.append(pro_arr, pro_lim)
-    else:
-        mask = fpr_arr <= fpr_limit
-        fpr_clip = fpr_arr[mask]
-        pro_clip = pro_arr[mask]
-        if fpr_clip[-1] < fpr_limit:
-            pro_lim = np.interp(fpr_limit, fpr_arr, pro_arr)
-            fpr_clip = np.append(fpr_clip, fpr_limit)
-            pro_clip = np.append(pro_clip, pro_lim)
-
-    auc_pro = np.trapz(pro_clip, fpr_clip) / max(fpr_limit, 1e-12)
-    return fpr_arr, pro_arr, thresholds, auc_pro
 
 
 # ---------- dataset ----------
@@ -200,7 +98,7 @@ class MyDataset(Dataset):
                 mk_np = np.zeros((H, W), dtype=np.uint8)
             else:
                 if isinstance(mk, Image.Image):
-                    mk_pil = mk.convert("L")
+                    mk_pil = mk.convert("L") # dovrebbe convertire correttamente il nero in 0 e il resto in 1
                 else:
                     # np.ndarray
                     mk_np0 = np.array(mk)           # può essere 0/1 o 0..255
@@ -454,112 +352,18 @@ def main():
             score_map = gaussian_filter(score_map, sigma=GAUSSIAN_SIGMA)
         score_map_list.append(score_map)
         
-    gt_pix = []
-    loader_masks = DataLoader(val_set, batch_size=32, shuffle=False, num_workers=0)
-    for _, _, m in loader_masks:                 # m: (B,H,W) uint8 {0,1}
-        gt_pix.append(m.numpy().reshape(m.size(0), -1))  # (B, H*W)
-    gt_pix = np.concatenate(gt_pix, axis=0).ravel().astype(np.uint8)  # (N_tot_pixel,) # i pixel messi in un array di tutte le maschere.
-
-    # --- 2) allinea e flattena le score map ---
-    # score_map_list: lista di array (H,W) float (più alto = più anomalo)
-    pred_pix = np.concatenate([sm.reshape(-1) for sm in score_map_list], axis=0)  # (N_tot_pixel,)
-
-    # (facoltativo: assicurati che lunghezze combacino)
-    assert gt_pix.shape[0] == pred_pix.shape[0], f"Pixels mismatch: gt {gt_pix.shape[0]} vs pred {pred_pix.shape[0]}"
-
-    # --- 3) ROC & AUROC per-pixel ---
-    fpr_pix, tpr_pix, thr_roc = roc_curve(gt_pix, pred_pix)
-    auc_pix = roc_auc_score(gt_pix, pred_pix)
-    print(f"[pixel-level] AUROC = {auc_pix:.3f}")
-
-    plt.plot(fpr_pix, tpr_pix, label=f"AUC={auc_pix:.3f}")
-    plt.plot([0,1],[0,1],'k--',linewidth=1)
-    plt.xlabel("FPR"); plt.ylabel("TPR")
-    plt.title("Pixel-level ROC")
-    plt.legend(loc="lower right")
-    plt.tight_layout()
-    plt.show()
-
-    J = tpr_pix - fpr_pix                         #TODO: vedere cosa è Youden's J statistic
-    best_idx_roc = int(np.argmax(J))
-    best_thr_roc = float(thr_roc[best_idx_roc])
-    print(f"[pixel-level] Best threshold (ROC/Youden): {best_thr_roc:.6f}  | TPR={tpr_pix[best_idx_roc]:.3f}  FPR={fpr_pix[best_idx_roc]:.3f}")
-
-    # ----------------------------
-    # 2) THRESHOLD da PR (F1 max)
-    # ----------------------------
-    prec, rec, thr_pr = precision_recall_curve(gt_pix, pred_pix)
-    # NB: thr_pr ha len = len(prec)-1 = len(rec)-1
-    f1_vals = 2 * prec[:-1] * rec[:-1] / (prec[:-1] + rec[:-1] + 1e-12)
-    best_idx_pr = int(np.argmax(f1_vals))
-    best_thr_pr = float(thr_pr[best_idx_pr])
-    print(f"[pixel-level] Best threshold (PR/F1):    {best_thr_pr:.6f}  | P={prec[best_idx_pr]:.3f}  R={rec[best_idx_pr]:.3f}  F1={f1_vals[best_idx_pr]:.3f}")
-
-    # ------------------------------------------
-    # 3) Applica le due soglie alle score map 2D
-    #    (score_map_list è la lista delle mappe (H,W))
-    # ------------------------------------------
-    masks_roc = [(sm >= best_thr_roc).astype(np.uint8) for sm in score_map_list]
-    masks_pr  = [(sm >= best_thr_pr ).astype(np.uint8) for sm in score_map_list]
-    acc_r, p_r, r_r, f1_r = eval_pixel_metrics(masks_roc, val_set)
-    acc_p, p_p, r_p, f1_p = eval_pixel_metrics(masks_pr,  val_set)
-
-    print(f"[pixel-level] ROC thr -> Acc={acc_r:.3f}  P={p_r:.3f}  R={r_r:.3f}  F1={f1_r:.3f}")
-    print(f"[pixel-level]  PR thr -> Acc={acc_p:.3f}  P={p_p:.3f}  R={r_p:.3f}  F1={f1_p:.3f}")
-    
-    
-    show_heatmaps_from_loader(
-        ds_or_loader=val_loader.dataset,   # o val_set
-        score_maps=masks_pr,       
-        scores=img_scores,                     # i tuoi image-level scores (N,)
-        per_page=6,
-        cols=3,
-        normalize_each=False,
-        overlay_alpha=0.45,
-        cmap="jet",
-        title_fmt="idx {i} | label {g} | score {s:.3f}",
+    # ---- Valutazione & visualizzazione (riusabile dai tuoi altri metodi) ----
+    results = run_pixel_level_evaluation(
+        score_map_list=score_map_list,
+        val_set=val_set,
+        img_scores=img_scores,
+        use_threshold="pro",   # "roc" | "pr" | "pro"
+        fpr_limit=0.01,         # resta di default 0.3
+        vis=True,
+        vis_ds_or_loader=val_loader.dataset
     )
 
-    # >>> calcolo PRO (Per-Region Overlap) e AUC-PRO@0.3
-    # ricostruisco la lista di GT mask (una per immagine, in ordine del val_set)
-    gt_mask_list = []
-    for _, _, m in DataLoader(val_set, batch_size=1, shuffle=False, num_workers=0):
-        gt_mask_list.append(m.squeeze(0).numpy().astype(np.uint8))
-
-    fpr_pro, pro_vals, thr_vals, auc_pro_val = compute_pro_curve(
-        score_map_list, gt_mask_list, num_thrs=200, fpr_limit=0.3
-    )
-    print(f"[pixel-level] AUC-PRO@0.3 = {auc_pro_val:.4f}")
-
-    # plot PRO vs FPR
-    plt.figure(figsize=(6,4))
-    plt.plot(fpr_pro, pro_vals, label=f"AUC-PRO@0.3={auc_pro_val:.4f}")
-    plt.axvline(0.3, linestyle='--', linewidth=1)
-    plt.xlabel("FPR")
-    plt.ylabel("PRO")
-    plt.title("PRO curve (Per-Region Overlap)")
-    plt.legend(loc="lower right")
-    plt.tight_layout()
-    plt.show()
-
-
-# Se vuoi valutare le metriche pixel-level su tutto il validation set:
-def eval_pixel_metrics(masks_bin_list, gt_dataset):
-    # flatten pred
-    pred_flat = np.concatenate([m.reshape(-1) for m in masks_bin_list], axis=0).astype(np.uint8)
-    # flatten gt (già lo hai come gt_pix, ma ricalcoliamo per completezza)
-    gt_flat = []
-    loader_masks = DataLoader(gt_dataset, batch_size=32, shuffle=False, num_workers=0)
-    for _, _, m in loader_masks:                      # m: (B,H,W) uint8 {0,1}
-        gt_flat.append(m.numpy().reshape(m.size(0), -1))
-    gt_flat = np.concatenate(gt_flat, axis=0).ravel().astype(np.uint8)
-
-    assert gt_flat.shape[0] == pred_flat.shape[0], "Mismatch gt vs pred pixel."
-    acc = accuracy_score(gt_flat, pred_flat)
-    p   = precision_score(gt_flat, pred_flat, zero_division=0)
-    r   = recall_score(gt_flat, pred_flat,    zero_division=0)
-    f1  = f1_score(gt_flat, pred_flat,        zero_division=0)
-    return acc, p, r, f1
-
+    print_pixel_report(results, title=f"{METHOD} | {CODICE_PEZZO}/{POSITION}")
+        
 if __name__ == "__main__":
     main()
