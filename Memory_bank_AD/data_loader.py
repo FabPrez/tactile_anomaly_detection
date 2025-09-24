@@ -262,44 +262,70 @@ def _features_dir_for(part: str, position: str | None) -> Path:
     else:
         return DATASET_ROOT / part / position / "features"
 
-def save_split_pickle(obj, part: str, position: str | None, split: str) -> Path:
+
+def _normalize_method(method: str) -> str:
+    """
+    Normalizza il nome del metodo per l'uso nel filename:
+    - lowercase
+    - spazi -> '-'
+    - rimuove caratteri non alfanumerici/underscore/dash
+    """
+    m = method.strip().lower().replace(" ", "-")
+    m = re.sub(r"[^a-z0-9_-]", "", m)
+    if not m:
+        raise ValueError("method non può essere vuoto dopo la normalizzazione")
+    return m
+
+
+def save_split_pickle(obj, part: str, position: str | None, split: str, method: str) -> Path:
     """
     Salva un pickle in:
-      - Dataset/<part>/features/<split>.pkl
-      - Dataset/<part>/<position>/features/<split>.pkl
+      - Dataset/<part>/features/<method>_<split>.pickle
+      - Dataset/<part>/<position>/features/<method>_<split>.pickle
     split: 'train' | 'validation'
+    method: nome del metodo (es. 'spade', 'padim', ...)
     """
     split = split.lower()
     if split not in {"train", "validation"}:
         raise ValueError("split deve essere 'train' oppure 'validation'")
+
+    method_norm = _normalize_method(method)
 
     dirpath = _features_dir_for(part, position)
     dirpath.mkdir(parents=True, exist_ok=True)
-    p = dirpath / f"{split}.pkl"
+
+    filename = f"{method_norm}_{split}.pickle"
+    p = dirpath / filename
 
     with open(p, "wb") as f:
         pickle.dump(obj, f, protocol=pickle.HIGHEST_PROTOCOL)
+
     print(f"[pickle] Salvato oggetto in {p}")
     return p
 
-def load_split_pickle(part: str, position: str | None, split: str):
+
+def load_split_pickle(part: str, position: str | None, split: str, method: str):
     """
     Carica un pickle da:
-      - Dataset/<part>/features/<split>.pkl
-      - Dataset/<part>/<position>/features/<split>.pkl
+      - Dataset/<part>/features/<method>_<split>.pickle
+      - Dataset/<part>/<position>/features/<method>_<split>.pickle
     split: 'train' | 'validation'
+    method: nome del metodo (es. 'spade', 'padim', ...)
     """
     split = split.lower()
     if split not in {"train", "validation"}:
         raise ValueError("split deve essere 'train' oppure 'validation'")
 
+    method_norm = _normalize_method(method)
+
     dirpath = _features_dir_for(part, position)
-    p = dirpath / f"{split}.pkl"
+    p = dirpath / f"{method_norm}_{split}.pickle"
 
     if not p.exists():
         raise FileNotFoundError(f"Pickle non trovato: {p}")
 
     with open(p, "rb") as f:
         obj = pickle.load(f)
+
     print(f"[pickle] Caricato oggetto da {p}")
     return obj

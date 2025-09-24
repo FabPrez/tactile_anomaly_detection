@@ -25,6 +25,7 @@ from view_utils import show_dataset_images, show_validation_grid_from_loader, sh
 
 
 # ----------------- CONFIG -----------------
+METHOD = "SPADE"
 CODICE_PEZZO = "PZ1"
 POSITION    = "pos1"    # oppure "all"
 TOP_K       = 7
@@ -32,7 +33,8 @@ IMG_SIZE    = 224       # input ResNet
 SEED        = 42
 
 VIS_VALID_DATASET = False
-GAUSSIAN_SIGMA = 2      # sigma per filtro gaussiano
+VIS_PREDICTION_ON_VALID_DATASET = False
+GAUSSIAN_SIGMA = 4      # sigma per filtro gaussiano
 # ------------------------------------------
 
 
@@ -179,7 +181,9 @@ def main():
     val_fault_set = Subset(fault_ds, val_fault_idx)
     val_set       = ConcatDataset([val_good_set, val_fault_set])
     
-    # show_dataset_images(val_set, batch_size=5, show_mask=True)
+    if VIS_VALID_DATASET:
+        show_dataset_images(val_set, batch_size=5, show_mask=True)
+        
     print(f"Train: {len(train_set)} good")
     print(f"Val:   {len(val_good_set)} good + {len(val_fault_set)} fault = {len(val_set)}")
 
@@ -207,7 +211,7 @@ def main():
 
     # ====== TRAIN FEATURES (cache) ======
     try:
-        train_outputs = load_split_pickle(CODICE_PEZZO, POSITION, split="train")
+        train_outputs = load_split_pickle(CODICE_PEZZO, POSITION, split="train", method=METHOD)
         print("[cache] Train features caricate da pickle.")
     except FileNotFoundError:
         print("[cache] Nessun pickle train: estraggo feature...")
@@ -220,7 +224,7 @@ def main():
             outputs = []
         for k in train_outputs:
             train_outputs[k] = torch.cat(train_outputs[k], dim=0)
-        save_split_pickle(train_outputs, CODICE_PEZZO, POSITION, split="train")
+        save_split_pickle(train_outputs, CODICE_PEZZO, POSITION, split="train", method=METHOD)
     
     # ci aspettiamo una struttura così di train_outputs:
     # {
@@ -233,7 +237,7 @@ def main():
 
     # ====== VAL FEATURES (cache) ======
     try:
-        pack         = load_split_pickle(CODICE_PEZZO, POSITION, split="validation")
+        pack         = load_split_pickle(CODICE_PEZZO, POSITION, split="validation", method=METHOD)
         test_outputs = pack['features']
         gt_list      = pack['labels']
         print("[cache] Validation features caricate da pickle.")
@@ -251,7 +255,7 @@ def main():
         for k in test_outputs:
             test_outputs[k] = torch.cat(test_outputs[k], dim=0)
         pack = {'features': test_outputs, 'labels': np.array(gt_list, dtype=np.int64)}
-        save_split_pickle(pack, CODICE_PEZZO, POSITION, split="validation")
+        save_split_pickle(pack, CODICE_PEZZO, POSITION, split="validation", method=METHOD)
 
     # --- controlli di allineamento ---
     gt_np = np.asarray(gt_list, dtype=np.int32)
@@ -304,7 +308,7 @@ def main():
     print(f"[check] len(val_loader.dataset) = {len(val_loader.dataset)}")
     print(f"[check] len(scores)             = {len(img_scores)}")
 
-    if VIS_VALID_DATASET:
+    if VIS_PREDICTION_ON_VALID_DATASET:
         show_validation_grid_from_loader(
             val_loader, img_scores, preds,
             per_page=4, samples_per_row=2,
@@ -360,7 +364,7 @@ def main():
     loader_masks = DataLoader(val_set, batch_size=32, shuffle=False, num_workers=0)
     for _, _, m in loader_masks:                 # m: (B,H,W) uint8 {0,1}
         gt_pix.append(m.numpy().reshape(m.size(0), -1))  # (B, H*W)
-    gt_pix = np.concatenate(gt_pix, axis=0).ravel().astype(np.uint8)  # (N_tot_pixel,)
+    gt_pix = np.concatenate(gt_pix, axis=0).ravel().astype(np.uint8)  # (N_tot_pixel,) # i pixel messi in un array di tutte le maschere.
 
     # --- 2) allinea e flattena le score map ---
     # score_map_list: lista di array (H,W) float (più alto = più anomalo)
