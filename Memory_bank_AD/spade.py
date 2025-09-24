@@ -19,6 +19,9 @@ import math
 from torchvision.models import wide_resnet50_2, Wide_ResNet50_2_Weights
 from sklearn.metrics import roc_curve, accuracy_score, confusion_matrix, roc_auc_score, precision_recall_curve, precision_score, recall_score, f1_score
 
+# >>> NEW: per componenti connesse nelle GT
+from scipy.ndimage import label as cc_label
+
 # miei pacchetti
 from data_loader import get_items, save_split_pickle, load_split_pickle
 from view_utils import show_dataset_images, show_validation_grid_from_loader, show_heatmaps_from_loader
@@ -65,6 +68,97 @@ def get_val_image_by_global_idx(val_loader, global_idx):
             return x[global_idx - seen].cpu().numpy()
         seen += b
     raise IndexError(f"indices out of range: {global_idx}, tot={seen}")
+
+
+# >>> NEW: funzioni per PRO
+def _compute_fpr_and_region_overlaps(pred_bin_list, gt_list):
+    """
+    pred_bin_list: lista di array binari (H,W) predetti (0/1)
+    gt_list:      lista di array binari (H,W) GT (0/1)
+    Ritorna:
+      fpr_scalar: FP / (FP+TN) aggregato su tutte le immagini
+      overlaps:   lista di overlap per ciascuna regione connessa di GT (|P∩G|/|G|)
+    """
+    assert len(pred_bin_list) == len(gt_list)
+    FP = 0
+    TN = 0
+    overlaps = []
+
+    for pred, gt in zip(pred_bin_list, gt_list):
+        # FPR globale sugli sfondi (gt==0)
+        bg = (gt == 0)
+        FP += np.logical_and(pred == 1, bg).sum()
+        TN += np.logical_and(pred == 0, bg).sum()
+
+        # PRO: per-region overlap sulle componenti connesse delle regioni GT
+        if (gt > 0).any():
+            lbl, ncomp = cc_label(gt.astype(np.uint8))
+            for k in range(1, ncomp + 1):
+                region = (lbl == k)
+                denom = region.sum()
+                if denom > 0:
+                    num = np.logical_and(pred == 1, region).sum()
+                    overlaps.append(num / float(denom))
+
+    fpr = FP / float(FP + TN + 1e-12)
+    return fpr, overlaps
+
+
+def compute_pro_curve(score_map_list, gt_mask_list, num_thrs=200, fpr_limit=0.3):
+    """
+    Calcola curva PRO (media overlap per regione GT) al variare della soglia,
+    insieme alla curva FPR; integra l'area fino a fpr_limit (default 0.3).
+    """
+    # soglie uniformi sul range dei punteggi
+    all_scores = np.concatenate([sm.reshape(-1) for sm in score_map_list], axis=0)
+    smin, smax = float(np.min(all_scores)), float(np.max(all_scores))
+    if smax <= smin + 1e-12:
+        # caso degenere: tutte le score uguali
+        thresholds = np.array([smin])
+    else:
+        thresholds = np.linspace(smin, smax, num=num_thrs, endpoint=True)
+
+    fpr_list = []
+    pro_list = []
+
+    for thr in thresholds:
+        pred_bin_list = [(sm >= thr).astype(np.uint8) for sm in score_map_list]
+        fpr, overlaps = _compute_fpr_and_region_overlaps(pred_bin_list, gt_mask_list)
+        fpr_list.append(fpr)
+        # media sugli overlap di tutte le regioni del dataset; se non ci sono regioni, PRO=0
+        pro_list.append(np.mean(overlaps) if len(overlaps) > 0 else 0.0)
+
+    fpr_arr = np.asarray(fpr_list)
+    pro_arr = np.asarray(pro_list)
+
+    # AUC fino a fpr_limit con semplice clipping + interpolazione del punto limite
+    order = np.argsort(fpr_arr)
+    fpr_arr = fpr_arr[order]
+    pro_arr = pro_arr[order]
+
+    # garantisco punto fpr=0
+    if fpr_arr[0] > 0.0:
+        pro0 = np.interp(0.0, fpr_arr, pro_arr)
+        fpr_arr = np.insert(fpr_arr, 0, 0.0)
+        pro_arr = np.insert(pro_arr, 0, pro0)
+
+    # taglio a fpr_limit e interpolo l'ultimo punto
+    if fpr_arr[-1] < fpr_limit:
+        pro_lim = np.interp(fpr_limit, fpr_arr, pro_arr)
+        fpr_clip = np.append(fpr_arr, fpr_limit)
+        pro_clip = np.append(pro_arr, pro_lim)
+    else:
+        mask = fpr_arr <= fpr_limit
+        fpr_clip = fpr_arr[mask]
+        pro_clip = pro_arr[mask]
+        if fpr_clip[-1] < fpr_limit:
+            pro_lim = np.interp(fpr_limit, fpr_arr, pro_arr)
+            fpr_clip = np.append(fpr_clip, fpr_limit)
+            pro_clip = np.append(pro_clip, pro_lim)
+
+    auc_pro = np.trapz(pro_clip, fpr_clip) / max(fpr_limit, 1e-12)
+    return fpr_arr, pro_arr, thresholds, auc_pro
+
 
 # ---------- dataset ----------
 class MyDataset(Dataset):
@@ -157,7 +251,7 @@ def main():
         CODICE_PEZZO, "rgb", label="fault", positions=POSITION,
         return_type="pil",
         with_masks=True, mask_return_type="numpy", mask_binarize=True,  # binarie 0/1
-        mask_align="order" 
+        mask_align="name" 
     )
     
     # ---- dataset ----
@@ -416,7 +510,7 @@ def main():
     
     show_heatmaps_from_loader(
         ds_or_loader=val_loader.dataset,   # o val_set
-        score_maps=masks_roc,       
+        score_maps=masks_pr,       
         scores=img_scores,                     # i tuoi image-level scores (N,)
         per_page=6,
         cols=3,
@@ -426,7 +520,29 @@ def main():
         title_fmt="idx {i} | label {g} | score {s:.3f}",
     )
 
- 
+    # >>> calcolo PRO (Per-Region Overlap) e AUC-PRO@0.3
+    # ricostruisco la lista di GT mask (una per immagine, in ordine del val_set)
+    gt_mask_list = []
+    for _, _, m in DataLoader(val_set, batch_size=1, shuffle=False, num_workers=0):
+        gt_mask_list.append(m.squeeze(0).numpy().astype(np.uint8))
+
+    fpr_pro, pro_vals, thr_vals, auc_pro_val = compute_pro_curve(
+        score_map_list, gt_mask_list, num_thrs=200, fpr_limit=0.3
+    )
+    print(f"[pixel-level] AUC-PRO@0.3 = {auc_pro_val:.4f}")
+
+    # plot PRO vs FPR
+    plt.figure(figsize=(6,4))
+    plt.plot(fpr_pro, pro_vals, label=f"AUC-PRO@0.3={auc_pro_val:.4f}")
+    plt.axvline(0.3, linestyle='--', linewidth=1)
+    plt.xlabel("FPR")
+    plt.ylabel("PRO")
+    plt.title("PRO curve (Per-Region Overlap)")
+    plt.legend(loc="lower right")
+    plt.tight_layout()
+    plt.show()
+
+
 # Se vuoi valutare le metriche pixel-level su tutto il validation set:
 def eval_pixel_metrics(masks_bin_list, gt_dataset):
     # flatten pred
@@ -447,4 +563,3 @@ def eval_pixel_metrics(masks_bin_list, gt_dataset):
 
 if __name__ == "__main__":
     main()
-    
