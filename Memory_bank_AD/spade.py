@@ -31,7 +31,7 @@ TOP_K       = 7
 IMG_SIZE    = 224       # input ResNet
 SEED        = 42
 
-VIS_VALID_DATASET = False
+VIS_VALID_DATASET = True
 GAUSSIAN_SIGMA = 2      # sigma per filtro gaussiano
 # ------------------------------------------
 
@@ -155,7 +155,7 @@ def main():
         CODICE_PEZZO, "rgb", label="fault", positions=POSITION,
         return_type="pil",
         with_masks=True, mask_return_type="numpy", mask_binarize=True,  # binarie 0/1
-        mask_align="order" 
+        mask_align="name" 
     )
     
     # ---- dataset ----
@@ -412,7 +412,7 @@ def main():
     
     show_heatmaps_from_loader(
         ds_or_loader=val_loader.dataset,   # o val_set
-        score_maps=masks_roc,       
+        score_maps=masks_pr,       
         scores=img_scores,                     # i tuoi image-level scores (N,)
         per_page=6,
         cols=3,
@@ -443,4 +443,3 @@ def eval_pixel_metrics(masks_bin_list, gt_dataset):
 
 if __name__ == "__main__":
     main()
-    
