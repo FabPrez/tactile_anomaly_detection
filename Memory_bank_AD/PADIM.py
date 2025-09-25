@@ -21,12 +21,12 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset, ConcatDataset, DataLoader
 from torchvision.models import wide_resnet50_2, resnet18
-# import datasets.mvtec as mvtec
 import torchvision.transforms.v2 as transforms
 
 from view_utils import show_dataset_images, show_validation_grid_from_loader, show_heatmaps_from_loader
-from spade import MyDataset, eval_pixel_metrics
+from spade import MyDataset
 from data_loader import get_items, load_split_pickle, save_split_pickle
+from ad_analysis import run_pixel_level_evaluation, print_pixel_report
 
 # ----------------- CONFIG -----------------
 METHOD = "PADIM"
@@ -276,87 +276,100 @@ def main():
             overlay=True, overlay_alpha=0.45
         )
 
-    # calculate per-pixel level ROCAUC
-    fpr, tpr, thr_roc = roc_curve(gt_mask.flatten(), score_map.flatten())
-    per_pixel_rocauc = roc_auc_score(gt_mask.flatten(), score_map.flatten())
-    total_pixel_roc_auc.append(per_pixel_rocauc)
-    print('pixel ROCAUC: %.3f' % (per_pixel_rocauc))
+    # # calculate per-pixel level ROCAUC
+    # fpr, tpr, thr_roc = roc_curve(gt_mask.flatten(), score_map.flatten())
+    # per_pixel_rocauc = roc_auc_score(gt_mask.flatten(), score_map.flatten())
+    # total_pixel_roc_auc.append(per_pixel_rocauc)
+    # print('pixel ROCAUC: %.3f' % (per_pixel_rocauc))
     
 
-    fig_pixel_rocauc.plot(fpr, tpr, label='%s ROCAUC: %.3f' % (CODICE_PEZZO, per_pixel_rocauc))
-    # save_dir = args.save_path + '/' + f'pictures_{args.arch}'
-    # os.makedirs(save_dir, exist_ok=True)
-    # plot_fig(test_imgs, scores, gt_mask_list, threshold, save_dir, class_name)
+    # fig_pixel_rocauc.plot(fpr, tpr, label='%s ROCAUC: %.3f' % (CODICE_PEZZO, per_pixel_rocauc))
+    # # save_dir = args.save_path + '/' + f'pictures_{args.arch}'
+    # # os.makedirs(save_dir, exist_ok=True)
+    # # plot_fig(test_imgs, scores, gt_mask_list, threshold, save_dir, class_name)
         
-    # end old for
+    # # end old for
 
-    print('Average ROCAUC: %.3f' % np.mean(total_roc_auc))
-    fig_img_rocauc.title.set_text('Average image ROCAUC: %.3f' % np.mean(total_roc_auc))
-    fig_img_rocauc.legend(loc="lower right")
+    # print('Average ROCAUC: %.3f' % np.mean(total_roc_auc))
+    # fig_img_rocauc.title.set_text('Average image ROCAUC: %.3f' % np.mean(total_roc_auc))
+    # fig_img_rocauc.legend(loc="lower right")
 
-    print('Average pixel ROCUAC: %.3f' % np.mean(total_pixel_roc_auc))
-    fig_pixel_rocauc.title.set_text('Average pixel ROCAUC: %.3f' % np.mean(total_pixel_roc_auc))
-    fig_pixel_rocauc.legend(loc="lower right")
+    # print('Average pixel ROCUAC: %.3f' % np.mean(total_pixel_roc_auc))
+    # fig_pixel_rocauc.title.set_text('Average pixel ROCAUC: %.3f' % np.mean(total_pixel_roc_auc))
+    # fig_pixel_rocauc.legend(loc="lower right")
 
-    fig.tight_layout()
-    # fig.savefig(os.path.join(args.save_path, 'roc_curve.png'), dpi=100)
+    # fig.tight_layout()
+    # # fig.savefig(os.path.join(args.save_path, 'roc_curve.png'), dpi=100)
      
-     # (N_tot_pixel,)
-    plt.plot(fpr, tpr, label=f"AUC={per_pixel_rocauc:.3f}")
-    plt.plot([0,1],[0,1],'k--',linewidth=1)
-    plt.xlabel("FPR"); plt.ylabel("TPR")
-    plt.title("Pixel-level ROC")
-    plt.legend(loc="lower right")
-    plt.tight_layout()
-    plt.show()
+    #  # (N_tot_pixel,)
+    # plt.plot(fpr, tpr, label=f"AUC={per_pixel_rocauc:.3f}")
+    # plt.plot([0,1],[0,1],'k--',linewidth=1)
+    # plt.xlabel("FPR"); plt.ylabel("TPR")
+    # plt.title("Pixel-level ROC")
+    # plt.legend(loc="lower right")
+    # plt.tight_layout()
+    # plt.show()
 
-    J = tpr - fpr                         #TODO: vedere cosa è Youden's J statistic
-    best_idx_roc = int(np.argmax(J))
-    best_thr_roc = float(thr_roc[best_idx_roc])
-    print(f"[pixel-level] Best threshold (ROC/Youden): {best_thr_roc:.6f}  | TPR={tpr[best_idx_roc]:.3f}  FPR={fpr[best_idx_roc]:.3f}")
+    # J = tpr - fpr                         #TODO: vedere cosa è Youden's J statistic
+    # best_idx_roc = int(np.argmax(J))
+    # best_thr_roc = float(thr_roc[best_idx_roc])
+    # print(f"[pixel-level] Best threshold (ROC/Youden): {best_thr_roc:.6f}  | TPR={tpr[best_idx_roc]:.3f}  FPR={fpr[best_idx_roc]:.3f}")
     
-    pred_pix = np.concatenate([sm.reshape(-1) for sm in score_map], axis=0) 
+    # pred_pix = np.concatenate([sm.reshape(-1) for sm in score_map], axis=0) 
     
-    gt_pix = []
-    loader_masks = DataLoader(val_set, batch_size=32, shuffle=False, num_workers=0)
-    for _, _, m in loader_masks:                 # m: (B,H,W) uint8 {0,1}
-        gt_pix.append(m.numpy().reshape(m.size(0), -1))  # (B, H*W)
-    gt_pix = np.concatenate(gt_pix, axis=0).ravel().astype(np.uint8)  
+    # gt_pix = []
+    # loader_masks = DataLoader(val_set, batch_size=32, shuffle=False, num_workers=0)
+    # for _, _, m in loader_masks:                 # m: (B,H,W) uint8 {0,1}
+    #     gt_pix.append(m.numpy().reshape(m.size(0), -1))  # (B, H*W)
+    # gt_pix = np.concatenate(gt_pix, axis=0).ravel().astype(np.uint8)  
 
-    # ----------------------------
-    # 2) THRESHOLD da PR (F1 max)
-    # ----------------------------
-    prec, rec, thr_pr = precision_recall_curve(gt_pix, pred_pix)
-    # NB: thr_pr ha len = len(prec)-1 = len(rec)-1
-    f1_vals = 2 * prec[:-1] * rec[:-1] / (prec[:-1] + rec[:-1] + 1e-12)
-    best_idx_pr = int(np.argmax(f1_vals))
-    best_thr_pr = float(thr_pr[best_idx_pr])
-    print(f"[pixel-level] Best threshold (PR/F1):    {best_thr_pr:.6f}  | P={prec[best_idx_pr]:.3f}  R={rec[best_idx_pr]:.3f}  F1={f1_vals[best_idx_pr]:.3f}")
+    # # ----------------------------
+    # # 2) THRESHOLD da PR (F1 max)
+    # # ----------------------------
+    # prec, rec, thr_pr = precision_recall_curve(gt_pix, pred_pix)
+    # # NB: thr_pr ha len = len(prec)-1 = len(rec)-1
+    # f1_vals = 2 * prec[:-1] * rec[:-1] / (prec[:-1] + rec[:-1] + 1e-12)
+    # best_idx_pr = int(np.argmax(f1_vals))
+    # best_thr_pr = float(thr_pr[best_idx_pr])
+    # print(f"[pixel-level] Best threshold (PR/F1):    {best_thr_pr:.6f}  | P={prec[best_idx_pr]:.3f}  R={rec[best_idx_pr]:.3f}  F1={f1_vals[best_idx_pr]:.3f}")
 
-    # ------------------------------------------
-    # 3) Applica le due soglie alle score map 2D
-    #    (score_map_list è la lista delle mappe (H,W))
-    # ------------------------------------------
-    masks_roc = [(sm >= best_thr_roc).astype(np.uint8) for sm in score_map]
-    masks_pr  = [(sm >= best_thr_pr ).astype(np.uint8) for sm in score_map]
-    acc_r, p_r, r_r, f1_r = eval_pixel_metrics(masks_roc, val_set)
-    acc_p, p_p, r_p, f1_p = eval_pixel_metrics(masks_pr,  val_set)
+    # # ------------------------------------------
+    # # 3) Applica le due soglie alle score map 2D
+    # #    (score_map_list è la lista delle mappe (H,W))
+    # # ------------------------------------------
+    # masks_roc = [(sm >= best_thr_roc).astype(np.uint8) for sm in score_map]
+    # masks_pr  = [(sm >= best_thr_pr ).astype(np.uint8) for sm in score_map]
+    # acc_r, p_r, r_r, f1_r = eval_pixel_metrics(masks_roc, val_set)
+    # acc_p, p_p, r_p, f1_p = eval_pixel_metrics(masks_pr,  val_set)
 
-    print(f"[pixel-level] ROC thr -> Acc={acc_r:.3f}  P={p_r:.3f}  R={r_r:.3f}  F1={f1_r:.3f}")
-    print(f"[pixel-level]  PR thr -> Acc={acc_p:.3f}  P={p_p:.3f}  R={r_p:.3f}  F1={f1_p:.3f}")
+    # print(f"[pixel-level] ROC thr -> Acc={acc_r:.3f}  P={p_r:.3f}  R={r_r:.3f}  F1={f1_r:.3f}")
+    # print(f"[pixel-level]  PR thr -> Acc={acc_p:.3f}  P={p_p:.3f}  R={r_p:.3f}  F1={f1_p:.3f}")
     
     
-    show_heatmaps_from_loader(
-        ds_or_loader=val_loader.dataset,   # o val_set
-        score_maps=masks_roc,       
-        scores=img_scores,                    # i tuoi image-level scores (N,)
-        per_page=6,
-        cols=3,
-        normalize_each=False,
-        overlay_alpha=0.45,
-        cmap="jet",
-        title_fmt="idx {i} | label {g} | score {s:.3f}",
+    # show_heatmaps_from_loader(
+    #     ds_or_loader=val_loader.dataset,   # o val_set
+    #     score_maps=masks_roc,       
+    #     scores=img_scores,                    # i tuoi image-level scores (N,)
+    #     per_page=6,
+    #     cols=3,
+    #     normalize_each=False,
+    #     overlay_alpha=0.45,
+    #     cmap="jet",
+    #     title_fmt="idx {i} | label {g} | score {s:.3f}",
+    # )
+    
+    # ---- Valutazione & visualizzazione (riusabile dai tuoi altri metodi) ----
+    results = run_pixel_level_evaluation(
+        score_map_list=score_map,
+        val_set=val_set,
+        img_scores=img_scores,
+        use_threshold="pro",   # "roc" | "pr" | "pro"
+        fpr_limit=0.01,         # resta di default 0.3
+        vis=True,
+        vis_ds_or_loader=val_loader.dataset
     )
+
+    print_pixel_report(results, title=f"{METHOD} | {CODICE_PEZZO}/{POSITION}")
 
 
 def plot_fig(test_img, scores, gts, threshold, save_dir, class_name):

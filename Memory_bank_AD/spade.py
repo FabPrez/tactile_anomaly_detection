@@ -31,13 +31,13 @@ from ad_analysis import run_pixel_level_evaluation, print_pixel_report
 # ----------------- CONFIG -----------------
 METHOD = "SPADE"
 CODICE_PEZZO = "PZ1"
-POSITION    = "pos1"    # oppure "all"
+POSITION    = "pos3"    # oppure "all"
 TOP_K       = 7
 IMG_SIZE    = 224       # input ResNet
 SEED        = 42
 
 VIS_VALID_DATASET = False
-VIS_PREDICTION_ON_VALID_DATASET = False
+VIS_PREDICTION_ON_VALID_DATASET = True
 GAUSSIAN_SIGMA = 4      # sigma per filtro gaussiano
 # ------------------------------------------
 
