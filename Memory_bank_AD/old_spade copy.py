@@ -23,53 +23,23 @@ from sklearn.metrics import roc_curve, accuracy_score, confusion_matrix, roc_auc
 from scipy.ndimage import label as cc_label
 
 # miei pacchetti
-from data_loader import save_split_pickle, load_split_pickle, build_ad_datasets, make_loaders
+from data_loader import get_items, save_split_pickle, load_split_pickle
 from view_utils import show_dataset_images, show_validation_grid_from_loader, show_heatmaps_from_loader
 from ad_analysis import run_pixel_level_evaluation, print_pixel_report
 
-#! TODO: configuration for training set that is in % of the amout -> voglio prendere solo il 10% delle immagini ad esempio e non tutte, posso farlo?
 
 # ----------------- CONFIG -----------------
 METHOD = "SPADE"
 CODICE_PEZZO = "PZ1"
+POSITION    = "all"  # oppure "all"
+TOP_K       = 7
+IMG_SIZE    = 224       # input ResNet
+SEED        = 42
 
-# Posizioni "good" usate per il TRAIN (feature bank).
-# Puoi passare una stringa ("pos1") oppure una lista (["pos1","pos2"]).
-TRAIN_POSITIONS = ["pos1","pos2","pos3"]
-
-# Quanti GOOD per posizione spostare nella VALIDATION (e quindi togliere dal TRAIN).
-# Può essere:
-#   - int (stesso valore per tutte le pos del VAL_GOOD_SCOPE)
-#   - dict per-posizione, es: {"pos1": 10, "pos2": 30}
-VAL_GOOD_PER_POS = 20
-# Esempio alternativo:
-# VAL_GOOD_PER_POS = {"pos1": 10, "pos2": 30}
-
-# Da quali posizioni prelevare i GOOD per la VALIDATION:
-#   "from_train"     -> solo dalle pos di TRAIN_POSITIONS
-#   "all_positions"  -> da tutte le pos disponibili
-#   ["pos1","pos3"]  -> lista custom
-VAL_GOOD_SCOPE = ["pos1","pos2","pos3"]
-
-# Da quali posizioni prendere le FAULT per la VALIDATION:
-#   "train_only" | "all" | lista custom (es. ["pos1","pos2"])
-VAL_FAULT_SCOPE = ["pos1","pos2","pos3"]
-
-# Percentuale di GOOD (rimasti dopo aver tolto quelli per la val) da usare nel TRAIN.
-# 1.0 = 100%, 0.1 = 10%, ecc. Questa percentuale entra nel tag dei pickle come "@pXX".
-GOOD_FRACTION = 0.30
-
-# Modello / dati
-TOP_K    = 5
-IMG_SIZE = 224
-SEED     = 42
-
-# Visualizzazioni
 VIS_VALID_DATASET = False
-VIS_PREDICTION_ON_VALID_DATASET = True
-GAUSSIAN_SIGMA = 4
+VIS_PREDICTION_ON_VALID_DATASET = False
+GAUSSIAN_SIGMA = 4      # sigma per filtro gaussiano
 # ------------------------------------------
-
 
 
 # ---------- util ----------
@@ -135,36 +105,132 @@ def topk_cdist_streaming(X, Y, k=7, block_x=1024, block_y=4096, device=torch.dev
 
 
 
+
+# ---------- dataset ----------
+class MyDataset(Dataset):
+    def __init__(self,
+                 images,                     # Sequence[PIL.Image.Image] (RGB)
+                 label_type: str,            # "good" -> 0, "fault" -> 1
+                 transform=None,             # es. transforms.CenterCrop(IMG_SIZE)
+                 masks=None                  # opzionale: Sequence[mask] (np.ndarray HxW o PIL), oppure None
+                 ):
+        assert label_type in {"good", "fault"}, "label_type deve essere 'good' o 'fault'"
+        self.label_value = 0 if label_type == "good" else 1
+        self.transform = transform
+        
+        mean = torch.tensor([0.485, 0.456, 0.406]).view(3,1,1)
+        std  = torch.tensor([0.229, 0.224, 0.225]).view(3,1,1)
+
+        # normalizza la lista maschere alla stessa lunghezza delle immagini
+        if masks is None:
+            masks = [None] * len(images)
+        else:
+            assert len(masks) == len(images), "masks deve avere stessa lunghezza di images"
+
+        imgs_t, masks_t = [], []
+
+        for img_pil, mk in zip(images, masks):
+            # --- immagine ---
+            assert isinstance(img_pil, Image.Image), "Le immagini devono essere PIL.Image"
+            if transform is not None:
+                img_pil = transform(img_pil)       # ancora PIL
+            img_np = np.array(img_pil)             # (H,W,C) uint8
+            img_t = torch.tensor(img_np, dtype=torch.float32).permute(2, 0, 1) / 255.0  # (C,H,W) in [0,1]
+            
+            # img_t = (img_t - mean) / std # comment if you don't want to normalize with respect to typical resnet parameters
+            
+            H, W = img_t.shape[1], img_t.shape[2]
+
+            # --- maschera ---
+            if mk is None:                          # good o mask mancante → tutta zero
+                mk_np = np.zeros((H, W), dtype=np.uint8)
+            else:
+                if isinstance(mk, Image.Image):
+                    mk_pil = mk.convert("L") # dovrebbe convertire correttamente il nero in 0 e il resto in 1
+                else:
+                    # np.ndarray
+                    mk_np0 = np.array(mk)           # può essere 0/1 o 0..255
+                    mk_pil = Image.fromarray(mk_np0.astype(np.uint8), mode="L")
+                # applica stesso transform geometrico (CenterCrop non interpola)
+                if transform is not None:
+                    mk_pil = transform(mk_pil)
+                mk_np = np.array(mk_pil, dtype=np.uint8)
+                # binarizza robustamente
+                mk_np = (mk_np > 0).astype(np.uint8)
+                # assicura stessa HxW dell'immagine
+                if mk_np.shape != (H, W):
+                    # fallback, dovrebbe raramente servire con stesso transform
+                    mk_pil = Image.fromarray(mk_np, mode="L").resize((W, H), resample=Image.NEAREST)
+                    mk_np = np.array(mk_pil, dtype=np.uint8)
+
+            imgs_t.append(img_t)
+            masks_t.append(torch.from_numpy(mk_np))    # (H,W) uint8 {0,1}
+
+        self.data   = torch.stack(imgs_t)                                # (N, C, H, W)
+        self.labels = torch.full((len(self.data),), self.label_value, dtype=torch.long)  # (N,)
+        self.masks  = torch.stack(masks_t)                                # (N, H, W) uint8 {0,1}
+
+        print('data shape ', self.data.shape)
+        print('label shape', self.labels.shape)
+        print('mask shape ', self.masks.shape)
+
+    def __getitem__(self, idx):
+        return self.data[idx], self.labels[idx], self.masks[idx]
+
+    def __len__(self):
+        return len(self.data)
+
+
+
 def main():
     # device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("**device found:", device)
 
-    # ======== DATASETS & LOADERS (presi da data_loader) ========
-    train_set, val_set, meta = build_ad_datasets(
-        part=CODICE_PEZZO,
-        img_size=IMG_SIZE,
-        train_positions=TRAIN_POSITIONS,
-        val_fault_scope=VAL_FAULT_SCOPE,
-        val_good_scope=VAL_GOOD_SCOPE,
-        val_good_per_pos=VAL_GOOD_PER_POS,   # NEW
-        good_fraction=GOOD_FRACTION,         # NEW
-        seed=SEED,
-        transform=None,  # oppure una tua pipeline T.Compose(...)
-    )
-    TRAIN_TAG = meta["train_tag"] 
-    print("[meta]", meta)
+    # transform deterministica
+    pre_processing = transforms.Compose([transforms.CenterCrop(IMG_SIZE)])
 
+    # ---- carico immagini + (per fault) maschere ----
+    good_imgs_pil = get_items(CODICE_PEZZO, "rgb", label="good", positions=POSITION, return_type="pil")
+    
+    fault_imgs_pil, fault_masks_np = get_items(
+        CODICE_PEZZO, "rgb", label="fault", positions=POSITION,
+        return_type="pil",
+        with_masks=True, mask_return_type="numpy", mask_binarize=True,  # binarie 0/1
+        mask_align="name" 
+    )
+    
+    # ---- dataset ----
+    good_ds  = MyDataset(good_imgs_pil,  label_type='good',  transform=pre_processing, masks=None)
+    fault_ds = MyDataset(fault_imgs_pil, label_type='fault', transform=pre_processing, masks=fault_masks_np)
+    
+    # split: train (solo good), val (k good + tutte fault)
+    n_good, n_fault = len(good_ds), len(fault_ds)
+    k = min(n_fault, n_good)
+
+    g = torch.Generator().manual_seed(SEED)
+    perm_good  = torch.randperm(n_good,  generator=g) # ordine casuale degli indici delle immagini good
+    perm_fault = torch.randperm(n_fault, generator=g) # ordine casuale degli indici delle immagini fault
+
+    val_good_idx   = perm_good[:k].tolist()
+    train_good_idx = perm_good[k:].tolist()
+    val_fault_idx  = perm_fault[:k].tolist()  # tutte le fault
+
+    train_set     = Subset(good_ds,  train_good_idx)
+    val_good_set  = Subset(good_ds,  val_good_idx)
+    val_fault_set = Subset(fault_ds, val_fault_idx)
+    val_set       = ConcatDataset([val_good_set, val_fault_set])
+    
     if VIS_VALID_DATASET:
         show_dataset_images(val_set, batch_size=5, show_mask=True)
+        
+    print(f"Train: {len(train_set)} good")
+    print(f"Val:   {len(val_good_set)} good + {len(val_fault_set)} fault = {len(val_set)}")
 
-    print(f"Train GOOD (pos {meta['train_positions']}): {meta['counts']['train_good']}")
-    print(f"Val   GOOD: {meta['counts']['val_good']}")
-    print(f"Val  FAULT (pos {meta['val_fault_positions']}): {meta['counts']['val_fault']}")
-    print(f"Val  TOT: {meta['counts']['val_total']}")
-
-    train_loader, val_loader = make_loaders(train_set, val_set, batch_size=32, device=device)
-
+    # DataLoader: su Windows evita multiprocess per stabilità (num_workers=0)
+    pin = (device.type == "cuda")
+    train_loader = DataLoader(train_set, batch_size=32, shuffle=True,  num_workers=0, pin_memory=pin)
+    val_loader   = DataLoader(val_set,   batch_size=32, shuffle=False, num_workers=0, pin_memory=pin)
 
     # modello + hook
     weights = Wide_ResNet50_2_Weights.IMAGENET1K_V1
@@ -183,9 +249,9 @@ def main():
     train_outputs = OrderedDict([('layer1', []), ('layer2', []), ('layer3', []), ('avgpool', [])])
     test_outputs  = OrderedDict([('layer1', []), ('layer2', []), ('layer3', []), ('avgpool', [])])
 
-    # ====== TRAIN FEATURES (cache SOLO TRAIN) ======
+    # ====== TRAIN FEATURES (cache) ======
     try:
-        train_outputs = load_split_pickle(CODICE_PEZZO, TRAIN_TAG, split="train", method=METHOD)
+        train_outputs = load_split_pickle(CODICE_PEZZO, POSITION, split="train", method=METHOD)
         print("[cache] Train features caricate da pickle.")
     except FileNotFoundError:
         print("[cache] Nessun pickle train: estraggo feature...")
@@ -194,11 +260,11 @@ def main():
             with torch.no_grad():
                 _ = model(x)
             for k, v in zip(train_outputs.keys(), outputs):
-                train_outputs[k].append(v.detach().cpu())   # -> CPU per non saturare VRAM
+                train_outputs[k].append(v.detach())
             outputs = []
         for k in train_outputs:
             train_outputs[k] = torch.cat(train_outputs[k], dim=0)
-        save_split_pickle(train_outputs, CODICE_PEZZO, TRAIN_TAG, split="train", method=METHOD)
+        save_split_pickle(train_outputs, CODICE_PEZZO, POSITION, split="train", method=METHOD)
     
     # ci aspettiamo una struttura così di train_outputs:
     # {
@@ -210,18 +276,26 @@ def main():
     # dove N è il numero di immagini. Mentre AVGPOOL è l'ultimo strato della resnet in questione, questo va ad utilizzare 2048 numeri per descrivere l'intera feature map, mediando sui canali
 
     # ====== VAL FEATURES (cache) ======
-    # ====== VALIDATION FEATURES (no cache) ======
-    gt_list = []
-    for x, y, m in tqdm(val_loader, desc='| feature extraction | validation | custom |'):
-        gt_list.extend(y.cpu().numpy())
-        x = x.to(device, non_blocking=True)
-        with torch.no_grad():
-            _ = model(x)
-        for k, v in zip(test_outputs.keys(), outputs):
-            test_outputs[k].append(v.detach().cpu())
-        outputs = []
-    for k in test_outputs:
-        test_outputs[k] = torch.cat(test_outputs[k], dim=0)
+    try:
+        pack         = load_split_pickle(CODICE_PEZZO, POSITION, split="validation", method=METHOD)
+        test_outputs = pack['features']
+        gt_list      = pack['labels']
+        print("[cache] Validation features caricate da pickle.")
+    except FileNotFoundError:
+        print("[cache] Nessun pickle validation: estraggo feature...")
+        gt_list = []
+        for x, y, m in tqdm(val_loader, desc='| feature extraction | validation | custom |'):
+            gt_list.extend(y.cpu().numpy())
+            x = x.to(device, non_blocking=True)
+            with torch.no_grad():
+                _ = model(x)
+            for k, v in zip(test_outputs.keys(), outputs):
+                test_outputs[k].append(v.detach())
+            outputs = []
+        for k in test_outputs:
+            test_outputs[k] = torch.cat(test_outputs[k], dim=0)
+        pack = {'features': test_outputs, 'labels': np.array(gt_list, dtype=np.int64)}
+        save_split_pickle(pack, CODICE_PEZZO, POSITION, split="validation", method=METHOD)
 
     # --- controlli di allineamento ---
     gt_np = np.asarray(gt_list, dtype=np.int32)
@@ -254,7 +328,7 @@ def main():
     fpr, tpr, thresholds = roc_curve(gt_np, img_scores)
     auc_img = roc_auc_score(gt_np, img_scores)
     
-    print(f"[image-level] ROC-AUC ({CODICE_PEZZO}/train={TRAIN_TAG}): {auc_img:.3f}")
+    print(f"[image-level] ROC-AUC ({CODICE_PEZZO}/{POSITION}): {auc_img:.3f}")
     
     # find the best treshold for the classifcation according to Youden's J
     J = tpr-fpr
@@ -267,7 +341,7 @@ def main():
     tn, fp, fn, tp = confusion_matrix(gt_np, preds, labels=[0, 1]).ravel()
     print(f"[image-level] soglia (Youden) = {best_thr:.6f}")
     print(f"[image-level] CM -> TN:{tn}  FP:{fp}  FN:{fn}  TP:{tp}")
-    print(f"[image-level] TPR:{tpr[best_idx]:.3f}  FPR:{fpr[best_idx]:.3f}")
+    print(f"[image-level] TPR:{fpr[best_idx]:.3f}  FPR:{tpr[best_idx]:.3f}")
 
     fig, ax = plt.subplots(1, 2, figsize=(20, 10))
     fig_img_rocauc = ax[0]
@@ -351,7 +425,7 @@ def main():
         vis_ds_or_loader=val_loader.dataset
     )
 
-    print_pixel_report(results, title=f"{METHOD} | {CODICE_PEZZO}/train={TRAIN_TAG}")
+    print_pixel_report(results, title=f"{METHOD} | {CODICE_PEZZO}/{POSITION}")
     
     
         

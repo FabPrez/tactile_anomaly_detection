@@ -37,9 +37,9 @@ def build_gt_arrays(val_set):
     return gt_pix, gt_mask_list
 
 
-def compute_pixel_curves(score_map_list, gt_pix, gt_mask_list, fpr_limit=0.3, num_thrs=200):
-    """Calcola curve ROC/PR (pixel-level) e PRO + AUC."""
-    # Pred pixel flatten (score “grezze”, più alto = più anomalo)
+def compute_pixel_curves(score_map_list, gt_pix, gt_mask_list, fpr_limit: float, num_thrs: int = 200):
+    """Calcola curve ROC/PR (pixel-level) e PRO + AUC rispettando SEMPRE fpr_limit passato."""
+    # Pred pixel flatten (score grezze, più alto = più anomalo)
     pred_pix = np.concatenate([sm.reshape(-1) for sm in score_map_list], axis=0).astype(np.float32)
     assert pred_pix.shape[0] == gt_pix.shape[0], "Pixels mismatch: pred vs gt"
 
@@ -51,7 +51,7 @@ def compute_pixel_curves(score_map_list, gt_pix, gt_mask_list, fpr_limit=0.3, nu
     prec, rec, thr_pr = precision_recall_curve(gt_pix, pred_pix)
     auprc_pix = average_precision_score(gt_pix, pred_pix)
 
-    # PRO
+    # PRO (rispetta fpr_limit passato)
     fpr_pro, pro_vals, thr_vals, auc_pro = compute_pro_curve(
         score_map_list, gt_mask_list, fpr_limit=fpr_limit
     )
@@ -60,23 +60,19 @@ def compute_pixel_curves(score_map_list, gt_pix, gt_mask_list, fpr_limit=0.3, nu
         "roc":  {"fpr": fpr_pix, "tpr": tpr_pix, "thr": thr_roc, "auc": auc_pix},
         "pr":   {"prec": prec, "rec": rec, "thr": thr_pr, "auprc": auprc_pix},
         "pro":  {"fpr": fpr_pro, "pro": pro_vals, "thr": thr_vals, "auc": auc_pro, "limit": fpr_limit},
-        "pred_pix": pred_pix,  # utile per debug/altre analisi
+        "pred_pix": pred_pix,
     }
 
 
-def select_thresholds(curves, mode_pro="max_pro"):
-    """Seleziona soglie:
-       - ROC: Youden (max TPR-FPR)
-       - PR:  max F1
-       - PRO: max PRO con FPR <= limite
-    """
+def select_thresholds(curves, mode_pro: str = "max_pro"):
+    """Sceglie soglie da curve (ROC Youden, PR max F1, PRO max sotto FPR≤limit)."""
     # ROC → Youden
     fpr = curves["roc"]["fpr"]; tpr = curves["roc"]["tpr"]; thr_roc = curves["roc"]["thr"]
     J = tpr - fpr
     best_idx_roc = int(np.argmax(J))
     best_thr_roc = float(thr_roc[best_idx_roc])
 
-    # PR → max F1 (note: thr_pr ha len = len(prec)-1)
+    # PR → max F1 (thr_pr ha len = len(prec)-1)
     prec = curves["pr"]["prec"]; rec = curves["pr"]["rec"]; thr_pr = curves["pr"]["thr"]
     f1_vals = 2 * prec[:-1] * rec[:-1] / (prec[:-1] + rec[:-1] + 1e-12)
     best_idx_pr = int(np.argmax(f1_vals))
@@ -134,7 +130,7 @@ def plot_pixel_curves(curves, title_suffix=""):
 
     # PRO
     fig3, ax3 = plt.subplots(1,1,figsize=(5,4))
-    ax3.plot(curves["pro"]["fpr"], curves["pro"]["pro"], label=f"AUC-PRO@0.3={curves['pro']['auc']:.3f}")
+    ax3.plot(curves["pro"]["fpr"], curves["pro"]["pro"], label=f"AUC-PRO@fpr_limit={curves['pro']['auc']:.3f}")
     ax3.axvline(curves["pro"]["limit"], ls='--', lw=1)
     ax3.set(xlabel="FPR", ylabel="PRO", title=f"PRO curve {title_suffix}")
     ax3.legend(loc="lower right"); fig3.tight_layout()
@@ -159,48 +155,13 @@ def visualize_heatmaps(ds_or_loader, score_maps, img_scores, per_page=6, cols=3,
         title_fmt=title_fmt,
     )
     
-def select_thresholds(curves):
-    """Seleziona soglie:
-       - ROC: Youden (max TPR-FPR)
-       - PR:  max F1
-       - PRO: max PRO con FPR <= fpr_limit
-    """
-    # ROC → Youden
-    fpr = curves["roc"]["fpr"]; tpr = curves["roc"]["tpr"]; thr_roc = curves["roc"]["thr"]
-    J = tpr - fpr
-    best_idx_roc = int(np.argmax(J))
-    best_thr_roc = float(thr_roc[best_idx_roc])
-
-    # PR → max F1 (nota: thr_pr ha len = len(prec)-1)
-    prec = curves["pr"]["prec"]; rec = curves["pr"]["rec"]; thr_pr = curves["pr"]["thr"]
-    f1_vals = 2 * prec[:-1] * rec[:-1] / (prec[:-1] + rec[:-1] + 1e-12)
-    best_idx_pr = int(np.argmax(f1_vals))
-    best_thr_pr = float(thr_pr[best_idx_pr])
-
-    # PRO → max PRO con FPR <= limite
-    fpr_pro = curves["pro"]["fpr"]; pro_vals = curves["pro"]["pro"]; thr_vals = curves["pro"]["thr"]
-    fpr_limit = curves["pro"]["limit"]
-    best_thr_pro, idx_pro, fpr_at_best, pro_at_best = select_threshold_from_pro(
-        fpr_pro, pro_vals, thr_vals, fpr_limit=fpr_limit, mode="max_pro"
-    )
-
-    return {
-        "roc": {"thr": best_thr_roc, "idx": best_idx_roc},
-        "pr":  {"thr": best_thr_pr,  "idx": best_idx_pr, "f1": float(f1_vals[best_idx_pr])},
-        "pro": {"thr": best_thr_pro, "idx": idx_pro, "fpr": fpr_at_best, "pro": pro_at_best},
-    }
-
+    
 def run_pixel_level_evaluation(score_map_list, val_set, img_scores,
-                               use_threshold="pro",     # "roc" | "pr" | "pro"
-                               fpr_limit=0.3,          # default 0.3
-                               vis=True, vis_ds_or_loader=None):
+                               use_threshold: str = "pro",     # "roc" | "pr" | "pro"
+                               fpr_limit: float = 0.3,         # puoi cambiarlo quando chiami la funzione
+                               vis: bool = True, vis_ds_or_loader=None):
     """
-    Pipeline completa pixel-level:
-      - GT pixel & per-regione
-      - curve ROC/PR/PRO (AUC/AUPRC/AUC-PRO@fpr_limit)
-      - soglie: ROC(Youden), PR(max F1), PRO(max PRO @ FPR≤fpr_limit)
-      - maschere + metriche
-      - visualizza CURVE e MASCHERE secondo `use_threshold`
+    Pipeline completa pixel-level. Il valore di fpr_limit passato QUI governa tutto il resto.
     """
     use_threshold = str(use_threshold).lower()
     if use_threshold not in {"roc", "pr", "pro"}:
@@ -209,12 +170,12 @@ def run_pixel_level_evaluation(score_map_list, val_set, img_scores,
     # 1) GT
     gt_pix, gt_mask_list = build_gt_arrays(val_set)
 
-    # 2) curve
+    # 2) curve (passa SEMPRE fpr_limit esplicitamente)
     curves = compute_pixel_curves(score_map_list, gt_pix, gt_mask_list,
                                   fpr_limit=fpr_limit, num_thrs=200)
 
     # 3) soglie (PRO = max PRO @ FPR≤fpr_limit)
-    thrs = select_thresholds(curves)
+    thrs = select_thresholds(curves, mode_pro="max_pro")
 
     # 4) maschere + metriche
     masks = make_masks(score_map_list, thrs)
@@ -228,7 +189,7 @@ def run_pixel_level_evaluation(score_map_list, val_set, img_scores,
     # 5) visual
     figs = None
     if vis:
-        figs = plot_pixel_curves(curves, title_suffix=f"(FPR≤{0.3}, {use_threshold.upper()})")
+        figs = plot_pixel_curves(curves, title_suffix=f"(FPR≤{fpr_limit}, {use_threshold.upper()})")
         visualize_heatmaps(
             ds_or_loader=(vis_ds_or_loader if vis_ds_or_loader is not None else val_set),
             score_maps=maps_to_show,        # binarie con la soglia scelta
@@ -238,10 +199,10 @@ def run_pixel_level_evaluation(score_map_list, val_set, img_scores,
         )
 
     return {
-        "curves": curves,            # ROC/PR/PRO + AUC
-        "thresholds": thrs,          # tutte: roc/pr/pro
-        "masks": masks,              # maschere per ciascuna soglia
-        "metrics": metrics,          # metriche aggregate
+        "curves": curves,
+        "thresholds": thrs,
+        "masks": masks,
+        "metrics": metrics,
         "selected": {
             "key": use_threshold,
             "threshold": selected_thr,
@@ -252,7 +213,11 @@ def run_pixel_level_evaluation(score_map_list, val_set, img_scores,
     }
 # ============================================================================
 
-def compute_pro_curve(score_map_list, gt_mask_list, fpr_limit=0.3):
+def compute_pro_curve(score_map_list, gt_mask_list, fpr_limit: float):
+    """
+    Calcola (FPR, PRO) e AUC-PRO NORMALIZZATA nel range [0, fpr_limit].
+    Ritorna anche un vettore di soglie 'thr_vals' allineato ai punti della curva.
+    """
     # 1) curva (FPR, PRO)
     fpr_arr, pro_arr = compute_pro(
         anomaly_maps=score_map_list,
@@ -260,11 +225,12 @@ def compute_pro_curve(score_map_list, gt_mask_list, fpr_limit=0.3):
     )
 
     # 2) AUC-PRO limitata e normalizzata
-    au_pro = trapezoid(fpr_arr, pro_arr, x_max=0.3)
-    auc_pro_norm = au_pro / max(0.3, 1e-12)
+    au_pro = trapezoid(fpr_arr, pro_arr, x_max=fpr_limit)
+    auc_pro_norm = au_pro / max(fpr_limit, 1e-12)
 
     # 3) ricostruzione soglie coerenti coi punti della curva
-    scores_flat = np.array(score_map_list, dtype=np.float32).ravel()
+    #    (usa una concatenazione corretta, NON np.array(list_of_arrays))
+    scores_flat = np.concatenate([sm.reshape(-1) for sm in score_map_list], axis=0).astype(np.float32)
     if scores_flat.size == 0:
         thr_vals = np.array([0.0, 0.0, 0.0], dtype=np.float32)
     else:
@@ -351,19 +317,10 @@ def get_val_image_by_global_idx(val_loader, global_idx):
     raise IndexError(f"indices out of range: {global_idx}, tot={seen}")
 
 
-def select_threshold_from_pro(fpr, pro, thr, fpr_limit=0.3, mode="max_pro"):
+def select_threshold_from_pro(fpr, pro, thr, fpr_limit: float, mode: str = "max_pro"):
     """
-    Seleziona la soglia τ a partire dalla curva PRO:
-      - fpr: array di FPR(τ) (pixel-level) per ciascuna soglia
-      - pro: array di PRO(τ) media per-regione
-      - thr: array delle soglie τ corrispondenti
-    Vincolo: FPR(τ) <= fpr_limit.
-    mode:
-      - "max_pro": massimizza PRO sotto il vincolo FPR
-      - "closest_to_limit": sceglie la soglia col FPR più vicino (da sinistra) al limite
-      - "tradeoff": massimizza (PRO - FPR) sotto il vincolo
-
-    Ritorna: (best_thr, best_idx, fpr_at_best, pro_at_best)
+    Seleziona la soglia τ a partire dalla curva PRO, con vincolo FPR(τ) ≤ fpr_limit.
+    Niente default “congelati”: il limite è sempre quello passato nel parametro.
     """
     fpr = np.asarray(fpr, dtype=float)
     pro = np.asarray(pro, dtype=float)
@@ -373,29 +330,23 @@ def select_threshold_from_pro(fpr, pro, thr, fpr_limit=0.3, mode="max_pro"):
     if fpr.size == 0:
         raise ValueError("Curve PRO vuota.")
 
-    # Considera solo i punti che rispettano il vincolo
+    # Solo i punti che rispettano il vincolo
     valid = np.where(fpr <= fpr_limit)[0]
 
-    # Se nessun punto rispetta il vincolo: prendi il punto a FPR minimo (più vicino al limite da destra)
+    # Se nessun punto rispetta il vincolo: prendi il punto a FPR minimo (da destra)
     if valid.size == 0:
         i = int(np.argmin(fpr))
         return float(thr[i]), i, float(fpr[i]), float(pro[i])
 
     if mode == "max_pro":
-        # Massimizza PRO tra i validi; se c'è parità su PRO, scegli FPR più basso
         i_local = valid[np.argmax(pro[valid])]
-        # tie-break opzionale
         ties = valid[np.isclose(pro[valid], pro[i_local])]
         if ties.size > 1:
             i_local = ties[np.argmin(fpr[ties])]
         i = int(i_local)
-
     elif mode == "closest_to_limit":
-        # Scegli il punto con FPR più vicino al limite, restando sotto (da sinistra)
         i = int(valid[np.argmin(np.abs(fpr[valid] - fpr_limit))])
-
     elif mode == "tradeoff":
-        # Massimizza (PRO - FPR) sotto il vincolo (semplice compromesso)
         score = pro[valid] - fpr[valid]
         i = int(valid[np.argmax(score)])
     else:
