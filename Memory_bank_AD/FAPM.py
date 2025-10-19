@@ -17,14 +17,14 @@ from view_utils import show_dataset_images, show_validation_grid_from_loader
 
 # ----------------- CONFIG -----------------
 METHOD = "FAPM_ADAPT"
-CODICE_PEZZO = "PZ1"
+CODICE_PEZZO = "PZ5"
 
 # Split come negli altri metodi
-TRAIN_POSITIONS = ["pos1","pos2"]
+TRAIN_POSITIONS = ["pos1"]
 VAL_GOOD_PER_POS = 0
 VAL_GOOD_SCOPE  = ["pos1"]
-VAL_FAULT_SCOPE = ["pos1","pos2"]
-GOOD_FRACTION   = 0.2
+VAL_FAULT_SCOPE = ["pos1"]
+GOOD_FRACTION   = 1.0
 
 # backbone & features
 IMG_SIZE  = 224

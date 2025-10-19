@@ -19,20 +19,20 @@ from scipy.ndimage import gaussian_filter
 
 # ----------------- CONFIG -----------------
 METHOD = "PADIM"
-CODICE_PEZZO = "PZ1"
+CODICE_PEZZO = "PZ5"
 
 # Posizioni "good" per il TRAIN (feature bank)
-TRAIN_POSITIONS = ["pos1","pos2"]
+TRAIN_POSITIONS = ["pos1"]
 
 # Quanti GOOD per posizione spostare in VALIDATION (ed escludere dal TRAIN)
-VAL_GOOD_PER_POS = 20
+VAL_GOOD_PER_POS = 0
 
 # Da quali posizioni prendere GOOD e FAULT per la VALIDATION
-VAL_GOOD_SCOPE  = ["pos1","pos2"]     # "from_train" | "all_positions" | lista
-VAL_FAULT_SCOPE = ["pos1","pos2"]     # "train_only" | "all" | lista
+VAL_GOOD_SCOPE  = ["pos1"]     # "from_train" | "all_positions" | lista
+VAL_FAULT_SCOPE = ["pos1"]     # "train_only" | "all" | lista
 
 # Percentuale di GOOD (dopo il taglio per la val) da usare nel TRAIN
-GOOD_FRACTION = 0.5
+GOOD_FRACTION = 1.0
 
 # PaDiM
 PADIM_D   = 550                  # canali selezionati (<= C_total)

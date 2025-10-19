@@ -15,49 +15,43 @@ DATASET_ROOT = BASE_DIR / "Dataset"
 
 # Estensioni supportate
 EXTS = {
-    "rgb": {".png"},          # aggiungi se necessario
+    "rgb": {".png"},
     "pointcloud": {".ply"},
 }
-EXTS_MASK = {".png"}          # maschere (binary png)
+EXTS_MASK = {".png"}  # maschere (binary png)
 
 # ---------------- natural sort ----------------
 _num_re = re.compile(r"(\d+)")
-
 def _natsort_key(s: str):
-    """Chiave per 'natural sort': 'task-10' dopo 'task-2'."""
     return [int(t) if t.isdigit() else t.lower() for t in _num_re.split(s)]
 
 def _iter_files(
-    root: Path,
+    root: Optional[Path],
     exts: set[str],
     sort_mode: Literal["natural", "name", "mtime"] = "natural",
 ) -> List[Path]:
-    """Ritorna i file con estensioni valide sotto root (ricorsivo), ordinati."""
-    if not root.exists():
+    if not root or not root.exists():
         return []
     exts_low = {e.lower() for e in exts}
     files = [p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in exts_low]
-
     if sort_mode == "natural":
         files.sort(key=lambda p: _natsort_key(p.name))
     elif sort_mode == "name":
         files.sort(key=lambda p: p.name.lower())
     elif sort_mode == "mtime":
-        files.sort(key=lambda p: p.stat().st_mtime)  # dalla più vecchia alla più nuova
+        files.sort(key=lambda p: p.stat().st_mtime)
     else:
         files.sort(key=lambda p: p.name.lower())
     return files
 
 # ---------------- util di base ----------------
 def list_positions(part: str) -> List[str]:
-    """Ritorna la lista delle posizioni disponibili (es. ['pos1','pos2',...])."""
     base = DATASET_ROOT / part
     if not base.exists():
         raise FileNotFoundError(f"Part non trovato: {base}")
     return sorted(d.name for d in base.iterdir() if d.is_dir() and d.name.lower().startswith("pos"))
 
 def _normalize_positions(part: str, positions: Union[None, str, Iterable[str]]) -> List[str]:
-    """Normalizza il parametro positions in una lista di posizioni."""
     if positions is None or positions == "*" or positions == "all":
         return list_positions(part)
     if isinstance(positions, str):
@@ -65,7 +59,6 @@ def _normalize_positions(part: str, positions: Union[None, str, Iterable[str]]) 
     return list(positions)
 
 def _load_rgb_pil(path: Path) -> Image.Image:
-    """Apre un'immagine RGB da path come PIL.Image (gestendo EXIF orientation)."""
     img = Image.open(path).convert("RGB")
     try:
         from PIL import ImageOps
@@ -75,7 +68,6 @@ def _load_rgb_pil(path: Path) -> Image.Image:
     return img
 
 def _load_mask_pil(path: Path) -> Image.Image:
-    """Maschera come L (8-bit, 0..255)."""
     img = Image.open(path).convert("L")
     try:
         from PIL import ImageOps
@@ -85,7 +77,6 @@ def _load_mask_pil(path: Path) -> Image.Image:
     return img
 
 def _norm_stem_for_match(stem: str) -> str:
-    """Normalizza lo stem per abbinare immagine e mask se si usa mask_align='name'."""
     s = stem.lower()
     for suf in ("_mask", "-mask", ".mask", " mask"):
         if s.endswith(suf):
@@ -103,27 +94,17 @@ def get_items(
     with_masks: bool = False,
     mask_return_type: Literal["path", "pil", "numpy"] = "numpy",
     mask_binarize: bool = True,     # se True: numpy 0/1 (o PIL con 0/255)
-    mask_align: Literal["order", "name"] = "order",  # "order" = per indice (dopo natural sort)
+    mask_align: Literal["order", "name"] = "order",  # mantenuto per compatibilità (qui usiamo l'indice)
 ) -> Union[
     List[Union[Path, Image.Image, np.ndarray]],
     tuple[List[Union[Path, Image.Image, np.ndarray]], List[Optional[Union[Path, Image.Image, np.ndarray]]]]
 ]:
     """
-    Restituisce elementi per:
-      - part: 'PZ1' | 'PZ2' | ...
-      - modality: 'rgb' | 'pointcloud'
-      - label: 'good' | 'fault'
-      - positions: None/'all'/'*' oppure 'pos2' oppure iterable di pos
-
-    return_type:
-      - 'path'  -> lista di pathlib.Path
-      - 'pil'   -> lista di PIL.Image.Image (solo modality='rgb')
-      - 'numpy' -> lista di np.ndarray (H,W,C) uint8 (solo modality='rgb')
-
-    Opzioni mask:
-      - with_masks=True -> ritorna anche la lista maschere allineata (solo fault/rgb).
-      - mask_align="order": abbina per indice (natural sort).
-      - mask_align="name" : abbina per nome normalizzato.
+    Layout usato:
+      - GOOD  -> immagini da: pos/rgb_320x240  (fallback pos/rgb)
+      - FAULT -> immagini da: pos/fault/rgb_320x240 -> pos/fault/rgb -> pos/rgb_320x240 -> pos/rgb
+                 maschere da: pos/fault/mask_320x240 -> pos/fault/mask
+      - FAULT: abbinamento img–mask per indice (natural sort), fino a min(#img, #mask).
     """
     modality = modality.lower()
     label = label.lower()
@@ -136,52 +117,62 @@ def get_items(
     pos_list = _normalize_positions(part, positions)
 
     results_paths: List[Path] = []
-    mask_paths_all: List[Optional[Path]] = []  # allineata a results_paths (None se assente)
+    mask_paths_all: List[Optional[Path]] = []
 
     for pos in pos_list:
-        # ----- immagini -----
-        img_dir = (base / pos / modality) if label == "good" else (base / pos / "fault" / modality)
-        imgs_here = _iter_files(img_dir, EXTS[modality], sort_mode="natural")
+        base_pos = base / pos
 
-        if not img_dir.exists():
-            print(f"[!] Cartella mancante: {img_dir}")
+        # ----- scegli cartella immagini in base al label -----
+        if modality == "rgb":
+            if label == "fault":
+                cand_imgs = [
+                    base_pos / "fault" / "rgb_320x240",
+                    base_pos / "fault" / "rgb",
+                    base_pos / "rgb_320x240",
+                    base_pos / "rgb",
+                ]
+            else:  # GOOD
+                cand_imgs = [
+                    base_pos / "rgb_320x240",
+                    base_pos / "rgb",
+                ]
+        else:
+            cand_imgs = [base_pos / "pointcloud_320x240", base_pos / "pointcloud"]
+
+        img_dir = next((p for p in cand_imgs if p.exists()), None)
+        imgs_here = _iter_files(img_dir, EXTS[modality], sort_mode="natural") if img_dir else []
+
+        if not img_dir:
+            print(f"[!] Cartella immagini non trovata per {part}/{pos}/{label}/{modality}. Provati: {cand_imgs}")
+            continue
         else:
             total = len(list(img_dir.glob("*")))
-            print(f"[{part}/{pos}/{label}/{modality}] Trovati {len(imgs_here)} di {total} file")
+            print(f"[{part}/{pos}/{label}/{modality}] Trovati {len(imgs_here)} di {total} file in {img_dir.name}")
 
-        results_paths.extend(imgs_here)
+        # ----- FAULT: abbina immagini e maschere per INDICE -----
+        if (label == "fault") and (modality == "rgb"):
+            cand_masks = [
+                base_pos / "fault" / "mask_320x240",
+                base_pos / "fault" / "mask",
+            ]
+            mask_dir = next((p for p in cand_masks if p.exists()), None)
+            masks_here = _iter_files(mask_dir, EXTS_MASK, sort_mode="natural") if mask_dir else []
 
-        # ----- maschere (solo se richieste e fault/rgb) -----
-        if with_masks and (label == "fault") and (modality == "rgb"):
-            mask_dir = base / pos / "fault" / "mask"
-            masks_here = _iter_files(mask_dir, EXTS_MASK, sort_mode="natural") if mask_dir.exists() else []
-
-            if mask_align == "order":
-                if len(masks_here) != len(imgs_here):
-                    print(f"[warn] {part}/{pos}: #mask ({len(masks_here)}) != #img ({len(imgs_here)}) — allineo per indice con padding/troncamento.")
-                for i in range(len(imgs_here)):
-                    mp = masks_here[i] if i < len(masks_here) else None
-                    mask_paths_all.append(mp)
-
-            elif mask_align == "name":
-                mask_map = {_norm_stem_for_match(mp.stem): mp for mp in masks_here}
-                for ip in imgs_here:
-                    key = _norm_stem_for_match(ip.stem)
-                    mp = mask_map.get(key, None)
-                    if mp is None:
-                        # fallback con suffissi comuni
-                        for suf in ("_mask", "-mask"):
-                            alt = (mask_dir / f"{ip.stem}{suf}{ip.suffix}")
-                            if alt.exists():
-                                mp = alt
-                                break
-                        if mp is None:
-                            print(f"[warn] mask non trovata per {ip.name} in {mask_dir}")
-                    mask_paths_all.append(mp)
+            n = min(len(imgs_here), len(masks_here))
+            if n == 0:
+                print(f"[WARN] {part}/{pos}: nessuna coppia img/mask (img={len(imgs_here)}, mask={len(masks_here)})")
             else:
-                raise ValueError("mask_align deve essere 'order' o 'name'.")
-        elif with_masks:
-            # richieste mask ma non applicabili: riempi con None
+                if len(imgs_here) != len(masks_here):
+                    print(f"[INFO] {part}/{pos}: allineamento per indice -> usati {n} pair "
+                          f"(img={len(imgs_here)}, mask={len(masks_here)})")
+                results_paths.extend(imgs_here[:n])
+                if with_masks:
+                    mask_paths_all.extend(masks_here[:n])
+            continue  # prossima posizione
+
+        # ----- GOOD (e altri casi): prendi tutto dalla cartella scelta -----
+        results_paths.extend(imgs_here)
+        if with_masks:
             mask_paths_all.extend([None] * len(imgs_here))
 
     # ---- solo immagini ----
@@ -204,7 +195,6 @@ def get_items(
         return out_imgs
 
     # ---- con maschere ----
-    # immagini
     if return_type == "path":
         imgs_out: List[Union[Path, Image.Image, np.ndarray]] = results_paths
     else:
@@ -220,7 +210,6 @@ def get_items(
             else:
                 raise ValueError("return_type non valido.")
 
-    # maschere
     masks_out: List[Optional[Union[Path, Image.Image, np.ndarray]]] = []
     for mp in mask_paths_all:
         if mp is None:
@@ -246,12 +235,6 @@ def get_items(
 
 # ---------------- pickle helpers ----------------
 def _features_dir_for(part: str, position: str | None) -> Path:
-    """
-    Salva sempre in: Dataset/<part>/features/<tag>/
-    dove <tag> è:
-      - 'all' se position è None/'all'/'*'
-      - altrimenti la stringa passata (es. 'pos1' o 'pos1+pos2' o 'pos1+pos2@p10')
-    """
     pos_norm = None if position is None else str(position).lower()
     tag = "all" if pos_norm in (None, "all", "*") else str(position)
     return DATASET_ROOT / part / "features" / tag
@@ -264,11 +247,6 @@ def _normalize_method(method: str) -> str:
     return m
 
 def save_split_pickle(obj, part: str, position: str | None, split: str, method: str) -> Path:
-    """
-    Salva in:
-      Dataset/<part>/features/<position|all>/<method>_<split>.pickle
-    split: 'train' | 'validation'
-    """
     split = split.lower()
     if split not in {"train", "validation"}:
         raise ValueError("split deve essere 'train' oppure 'validation'")
@@ -283,11 +261,6 @@ def save_split_pickle(obj, part: str, position: str | None, split: str, method: 
     return p
 
 def load_split_pickle(part: str, position: str | None, split: str, method: str):
-    """
-    Carica da:
-      Dataset/<part>/features/<position|all>/<method>_<split>.pickle
-    split: 'train' | 'validation'
-    """
     split = split.lower()
     if split not in {"train", "validation"}:
         raise ValueError("split deve essere 'train' oppure 'validation'")
@@ -307,7 +280,6 @@ def load_split_pickle(part: str, position: str | None, split: str, method: str):
 import torch
 from torch.utils.data import Dataset, DataLoader, Subset, ConcatDataset
 
-# ---------- helpers generali ----------
 def _ensure_list(x):
     if x is None:
         return []
@@ -326,7 +298,6 @@ def _train_tag_with_fraction(pos_list, good_fraction: float | None):
     return f"{base}@p{pct}"
 
 def _resolve_val_fault_positions(all_pos, train_pos_list, scope):
-    # scope: "train_only" | "all" | lista custom
     if isinstance(scope, (list, tuple, set)):
         return [p for p in all_pos if p in scope]
     scope = str(scope).lower()
@@ -337,7 +308,6 @@ def _resolve_val_fault_positions(all_pos, train_pos_list, scope):
     raise ValueError("VAL_FAULT_SCOPE non riconosciuto")
 
 def _resolve_val_good_positions(all_pos, train_pos_list, scope):
-    # scope: "from_train" | "all_positions" | "none" | lista custom
     if isinstance(scope, (list, tuple, set)):
         return [p for p in all_pos if p in scope]
     scope = str(scope).lower()
@@ -350,7 +320,6 @@ def _resolve_val_good_positions(all_pos, train_pos_list, scope):
     raise ValueError("VAL_GOOD_SCOPE non riconosciuto")
 
 def _get_T():
-    # compat torchvision v2/v1
     try:
         from torchvision import transforms as _t1  # noqa: F401
         from torchvision.transforms import v2 as T
@@ -401,6 +370,10 @@ class MyDataset(Dataset):
             imgs_t.append(img_t)
             masks_t.append(torch.from_numpy(mk_np))
 
+        if len(imgs_t) == 0:
+            raise ValueError("Nessuna immagine nel dataset costruito (lista vuota). "
+                             "Controlla percorsi/cartelle e split.")
+
         self.data   = torch.stack(imgs_t)                                # (N, C, H, W)
         self.labels = torch.full((len(self.data),), self.label_value, dtype=torch.long)
         self.masks  = torch.stack(masks_t)
@@ -411,7 +384,6 @@ class MyDataset(Dataset):
     def __len__(self):
         return len(self.data)
 
-# ------ selezione per-posizione di K good per la validation ------
 def _cap_warn(pos, want, avail):
     k = min(int(want), int(avail))
     if k < want:
@@ -419,11 +391,6 @@ def _cap_warn(pos, want, avail):
     return k
 
 def _k_map_for_positions(positions, val_good_per_pos):
-    """
-    positions: lista di posizioni candidate
-    val_good_per_pos: int unico o dict {pos: k}
-    Ritorna: dict {pos: k_int >=0}
-    """
     if val_good_per_pos is None:
         return {p: 0 for p in positions}
     if isinstance(val_good_per_pos, int):
@@ -446,14 +413,12 @@ def build_ad_datasets(
     transform=None,
 ):
     """
-    - Seleziona per ogni posizione k=VAL_GOOD_PER_POS immagini GOOD per la validation.
-    - Qualunque GOOD usata in validation viene rimossa dal TRAIN.
-    - Sulle GOOD rimanenti per il TRAIN applica un sotto-campionamento per-posizione con good_fraction.
+    - Seleziona per posizione k=VAL_GOOD_PER_POS immagini GOOD per la validation.
+    - Rimuove queste GOOD dal TRAIN, poi applica il sotto-campionamento per-posizione con good_fraction.
     - Ritorna (train_set, val_set, meta).
     """
     T = _get_T()
     if transform is None:
-        # CenterCrop: v2 è un Transform, v1 usa Compose
         try:
             transform = T.CenterCrop(img_size)
         except Exception:
@@ -470,7 +435,7 @@ def build_ad_datasets(
     else:
         k_map = _k_map_for_positions(val_good_pos, val_good_per_pos)
 
-    # FAULT validation
+    # FAULT validation (img da fault/rgb_320x240*, mask da fault/mask_320x240*)
     val_fault_pos = _resolve_val_fault_positions(all_pos, train_pos_list, val_fault_scope)
     fault_val_pil, fault_val_masks = get_items(
         part, "rgb", label="fault", positions=val_fault_pos, return_type="pil",
@@ -502,7 +467,7 @@ def build_ad_datasets(
         per_pos_counts[pos] = {
             "good_total": n,
             "good_val":   len(sel),
-            "good_train": len(keep),  # prima del fraction
+            "good_train": len(keep),
         }
 
     # 2) posizioni extra per la validation (non in train)
@@ -518,11 +483,7 @@ def build_ad_datasets(
         else:
             sel = []
         val_sel_by_pos[pos] = sel
-        per_pos_counts[pos] = {
-            "good_total": n,
-            "good_val":   len(sel),
-            "good_train": 0,
-        }
+        per_pos_counts[pos] = {"good_total": n, "good_val": len(sel), "good_train": 0}
 
     # --- sotto-campionamento percentuale del TRAIN per posizione ---
     good_train_remaining: list[Image.Image] = []
@@ -559,7 +520,7 @@ def build_ad_datasets(
         val_set = fault_val_ds
 
     meta = {
-        "train_tag": train_tag,                        # include @pXX se fraction < 1
+        "train_tag": train_tag,
         "good_fraction": good_fraction,
         "train_positions": train_pos_list,
         "val_fault_positions": val_fault_pos,
