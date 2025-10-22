@@ -31,7 +31,7 @@ from ad_analysis import run_pixel_level_evaluation, print_pixel_report
 
 # ----------------- CONFIG -----------------
 METHOD = "SPADE"
-CODICE_PEZZO = "PZ5"
+CODICE_PEZZO = "PZ4"
 
 # Posizioni "good" usate per il TRAIN (feature bank).
 # Puoi passare una stringa ("pos1") oppure una lista (["pos1","pos2"]).
