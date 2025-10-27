@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import List, Iterable, Union, Literal, Optional
+from typing import List, Iterable, Union, Literal, Optional, Tuple
 import pickle
 import re
 
@@ -95,15 +95,16 @@ def get_items(
     mask_return_type: Literal["path", "pil", "numpy"] = "numpy",
     mask_binarize: bool = True,     # se True: numpy 0/1 (o PIL con 0/255)
     mask_align: Literal["order", "name"] = "order",  # mantenuto per compatibilità (qui usiamo l'indice)
+    rgb_policy: Literal["prefer_320", "prefer_fullres", "fullres_only"] = "prefer_320",  # NEW
 ) -> Union[
     List[Union[Path, Image.Image, np.ndarray]],
     tuple[List[Union[Path, Image.Image, np.ndarray]], List[Optional[Union[Path, Image.Image, np.ndarray]]]]
 ]:
     """
     Layout usato:
-      - GOOD  -> immagini da: pos/rgb_320x240  (fallback pos/rgb)
-      - FAULT -> immagini da: pos/fault/rgb_320x240 -> pos/fault/rgb -> pos/rgb_320x240 -> pos/rgb
-                 maschere da: pos/fault/mask_320x240 -> pos/fault/mask
+      - GOOD  -> immagini da: (policy) tra rgb_320x240 e rgb
+      - FAULT -> immagini da: (policy) tra fault/rgb_320x240 e fault/rgb (fallback anche a good/rgb in caso di dataset ibridi)
+                 maschere da: (policy) tra fault/mask_320x240 e fault/mask
       - FAULT: abbinamento img–mask per indice (natural sort), fino a min(#img, #mask).
     """
     modality = modality.lower()
@@ -122,22 +123,49 @@ def get_items(
     for pos in pos_list:
         base_pos = base / pos
 
-        # ----- scegli cartella immagini in base al label -----
+        # ----- scegli cartella immagini in base al label & policy -----
         if modality == "rgb":
             if label == "fault":
-                cand_imgs = [
-                    base_pos / "fault" / "rgb_320x240",
-                    base_pos / "fault" / "rgb",
-                    base_pos / "rgb_320x240",
-                    base_pos / "rgb",
-                ]
+                if rgb_policy == "prefer_320":
+                    cand_imgs = [
+                        base_pos / "fault" / "rgb_320x240",
+                        base_pos / "fault" / "rgb",
+                        base_pos / "rgb_320x240",
+                        base_pos / "rgb",
+                    ]
+                elif rgb_policy == "prefer_fullres":
+                    cand_imgs = [
+                        base_pos / "fault" / "rgb",
+                        base_pos / "fault" / "rgb_320x240",
+                        base_pos / "rgb",
+                        base_pos / "rgb_320x240",
+                    ]
+                elif rgb_policy == "fullres_only":
+                    cand_imgs = [base_pos / "fault" / "rgb"]
+                else:
+                    raise ValueError(f"rgb_policy non valido: {rgb_policy}")
             else:  # GOOD
-                cand_imgs = [
-                    base_pos / "rgb_320x240",
-                    base_pos / "rgb",
-                ]
+                if rgb_policy == "prefer_320":
+                    cand_imgs = [
+                        base_pos / "rgb_320x240",
+                        base_pos / "rgb",
+                    ]
+                elif rgb_policy == "prefer_fullres":
+                    cand_imgs = [
+                        base_pos / "rgb",
+                        base_pos / "rgb_320x240",
+                    ]
+                elif rgb_policy == "fullres_only":
+                    cand_imgs = [base_pos / "rgb"]
+                else:
+                    raise ValueError(f"rgb_policy non valido: {rgb_policy}")
         else:
-            cand_imgs = [base_pos / "pointcloud_320x240", base_pos / "pointcloud"]
+            if rgb_policy == "prefer_320":
+                cand_imgs = [base_pos / "pointcloud_320x240", base_pos / "pointcloud"]
+            elif rgb_policy in ("prefer_fullres", "fullres_only"):
+                cand_imgs = [base_pos / "pointcloud", base_pos / "pointcloud_320x240"]
+            else:
+                cand_imgs = [base_pos / "pointcloud_320x240", base_pos / "pointcloud"]
 
         img_dir = next((p for p in cand_imgs if p.exists()), None)
         imgs_here = _iter_files(img_dir, EXTS[modality], sort_mode="natural") if img_dir else []
@@ -151,10 +179,21 @@ def get_items(
 
         # ----- FAULT: abbina immagini e maschere per INDICE -----
         if (label == "fault") and (modality == "rgb"):
-            cand_masks = [
-                base_pos / "fault" / "mask_320x240",
-                base_pos / "fault" / "mask",
-            ]
+            if rgb_policy == "prefer_320":
+                cand_masks = [
+                    base_pos / "fault" / "mask_320x240",
+                    base_pos / "fault" / "mask",
+                ]
+            elif rgb_policy == "prefer_fullres":
+                cand_masks = [
+                    base_pos / "fault" / "mask",
+                    base_pos / "fault" / "mask_320x240",
+                ]
+            elif rgb_policy == "fullres_only":
+                cand_masks = [base_pos / "fault" / "mask"]
+            else:
+                raise ValueError(f"rgb_policy non valido: {rgb_policy}")
+
             mask_dir = next((p for p in cand_masks if p.exists()), None)
             masks_here = _iter_files(mask_dir, EXTS_MASK, sort_mode="natural") if mask_dir else []
 
@@ -403,7 +442,7 @@ def _k_map_for_positions(positions, val_good_per_pos):
 def build_ad_datasets(
     *,
     part: str,
-    img_size: int,
+    img_size: Optional[Union[int, Tuple[int, int]]] = None,  # opzionale e può essere (H,W)
     train_positions,            # str | list[str]
     val_fault_scope,            # "train_only" | "all" | list[str]
     val_good_scope,             # "from_train" | "all_positions" | "none" | list[str]
@@ -411,18 +450,32 @@ def build_ad_datasets(
     good_fraction: float | None = 1.0,     # % delle GOOD rimanenti da usare per il TRAIN per posizione
     seed: int = 42,
     transform=None,
+    rgb_policy: Literal["prefer_320", "prefer_fullres", "fullres_only"] = "prefer_320",  # NEW
 ):
     """
+    - Se img_size è None => nessuna trasformazione di crop/resize (full-res).
+    - Se img_size è int => CenterCrop(img_size, img_size).
+    - Se img_size è (H, W) => CenterCrop((H, W)).
+    - Se transform è passato, viene rispettato e img_size viene ignorato.
     - Seleziona per posizione k=VAL_GOOD_PER_POS immagini GOOD per la validation.
     - Rimuove queste GOOD dal TRAIN, poi applica il sotto-campionamento per-posizione con good_fraction.
     - Ritorna (train_set, val_set, meta).
     """
     T = _get_T()
+
+    # --- gestione transform / center-crop pulita ---
     if transform is None:
-        try:
-            transform = T.CenterCrop(img_size)
-        except Exception:
-            transform = T.Compose([T.CenterCrop(img_size)])
+        if img_size is None:
+            transform = None
+        else:
+            if isinstance(img_size, int):
+                size_tuple = (img_size, img_size)
+            elif isinstance(img_size, (tuple, list)) and len(img_size) == 2:
+                size_tuple = (int(img_size[0]), int(img_size[1]))
+            else:
+                raise ValueError(f"img_size deve essere int oppure (H, W); trovato: {img_size!r}")
+            transform = T.CenterCrop(size_tuple)
+    # altrimenti: se transform è già fornita dal chiamante, non toccarla
 
     all_pos = list_positions(part)
     train_pos_list = _ensure_list(train_positions)
@@ -435,11 +488,12 @@ def build_ad_datasets(
     else:
         k_map = _k_map_for_positions(val_good_pos, val_good_per_pos)
 
-    # FAULT validation (img da fault/rgb_320x240*, mask da fault/mask_320x240*)
+    # FAULT validation (img & mask secondo policy)
     val_fault_pos = _resolve_val_fault_positions(all_pos, train_pos_list, val_fault_scope)
     fault_val_pil, fault_val_masks = get_items(
         part, "rgb", label="fault", positions=val_fault_pos, return_type="pil",
-        with_masks=True, mask_return_type="numpy", mask_binarize=True, mask_align="order"
+        with_masks=True, mask_return_type="numpy", mask_binarize=True, mask_align="order",
+        rgb_policy=rgb_policy
     )
 
     rng = torch.Generator().manual_seed(seed)
@@ -451,7 +505,8 @@ def build_ad_datasets(
 
     # 1) posizioni del TRAIN: splitto togliendo k per la val
     for pos in train_pos_list:
-        imgs_pos = get_items(part, "rgb", label="good", positions=[pos], return_type="pil")
+        imgs_pos = get_items(part, "rgb", label="good", positions=[pos], return_type="pil",
+                             rgb_policy=rgb_policy)
         n = len(imgs_pos)
         k = int(k_map.get(pos, 0)) if pos in val_good_pos else 0
         if k > 0:
@@ -473,7 +528,8 @@ def build_ad_datasets(
     # 2) posizioni extra per la validation (non in train)
     extra_val_pos = [p for p in val_good_pos if p not in train_pos_list]
     for pos in extra_val_pos:
-        imgs_pos = get_items(part, "rgb", label="good", positions=[pos], return_type="pil")
+        imgs_pos = get_items(part, "rgb", label="good", positions=[pos], return_type="pil",
+                             rgb_policy=rgb_policy)
         n = len(imgs_pos)
         k = int(k_map.get(pos, 0))
         k = _cap_warn(pos, k, n) if k > 0 else 0

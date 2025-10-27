@@ -19,17 +19,17 @@ from scipy.ndimage import gaussian_filter
 
 # ----------------- CONFIG -----------------
 METHOD = "PADIM"
-CODICE_PEZZO = "PZ5"
+CODICE_PEZZO = "PZ3"
 
 # Posizioni "good" per il TRAIN (feature bank)
-TRAIN_POSITIONS = ["pos1"]
+TRAIN_POSITIONS = ["pos2"]
 
 # Quanti GOOD per posizione spostare in VALIDATION (ed escludere dal TRAIN)
 VAL_GOOD_PER_POS = 0
 
 # Da quali posizioni prendere GOOD e FAULT per la VALIDATION
-VAL_GOOD_SCOPE  = ["pos1"]     # "from_train" | "all_positions" | lista
-VAL_FAULT_SCOPE = ["pos1"]     # "train_only" | "all" | lista
+VAL_GOOD_SCOPE  = ["pos2"]     # "from_train" | "all_positions" | lista
+VAL_FAULT_SCOPE = ["pos2"]     # "train_only" | "all" | lista
 
 # Percentuale di GOOD (dopo il taglio per la val) da usare nel TRAIN
 GOOD_FRACTION = 1.0
@@ -57,6 +57,99 @@ def embedding_concat_nn(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     """
     y_up = F.interpolate(y, size=(x.shape[-2], x.shape[-1]), mode='nearest')
     return torch.cat([x, y_up], dim=1)
+
+
+class PaDiMTileModel:
+    """
+    PaDiM per un singolo tile: salva mean/cov per ogni posizione, predice heatmap Mahalanobis.
+    """
+    def __init__(self, padim_d=550, img_size=224, ridge=0.01, gaussian_sigma=4, device="cpu"):
+        self.padim_d = padim_d
+        self.img_size = img_size
+        self.ridge = ridge
+        self.gaussian_sigma = gaussian_sigma
+        self.device = torch.device(device)
+        self.mean = None
+        self.cov = None
+        self.sel_idx = None
+        self.H = None
+        self.W = None
+
+        weights = Wide_ResNet50_2_Weights.IMAGENET1K_V1
+        self.model = wide_resnet50_2(weights=weights).to(self.device).eval()
+        self.outputs = []
+        def hook(_m, _in, out): self.outputs.append(out)
+        self.model.layer1[-1].register_forward_hook(hook)
+        self.model.layer2[-1].register_forward_hook(hook)
+        self.model.layer3[-1].register_forward_hook(hook)
+
+    def _extract_embedding(self, img_np):
+        img_t = torch.tensor(img_np, dtype=torch.float32)
+        if img_t.max() > 1.0:
+            img_t = img_t / 255.0
+        img_t = img_t.permute(2,0,1).unsqueeze(0).to(self.device)
+        self.outputs.clear()
+        with torch.no_grad():
+            _ = self.model(img_t)
+        l1, l2, l3 = [t.cpu() for t in self.outputs[:3]]
+        emb = embedding_concat_nn(l1, l2)
+        emb = embedding_concat_nn(emb, l3)  # (1, Ctot, H, W)
+        C_total = emb.shape[1]
+        if self.sel_idx is None:
+            d = min(self.padim_d, C_total)
+            rng = torch.Generator().manual_seed(1024)
+            self.sel_idx = torch.randperm(C_total, generator=rng)[:d].tolist()
+        emb = emb[:, self.sel_idx, :, :]  # (1, d, H, W)
+        B, d, H, W = emb.shape
+        self.H, self.W = H, W
+        return emb.view(B, d, H*W).squeeze(0)  # (d, L)
+
+    def fit(self, tiles):
+        # tiles: lista di immagini (H,W,C)
+        feats = []
+        for tile in tiles:
+            emb = self._extract_embedding(tile)  # (d, L)
+            feats.append(emb)
+        X = torch.stack(feats, dim=0)  # (N, d, L)
+        N, d, L = X.shape
+        mean = X.mean(dim=0)  # (d, L)
+        cov = torch.zeros((d, d, L), dtype=torch.float32)
+        for l in range(L):
+            diffs = X[:,:,l] - mean[:,l][None,:]  # (N, d)
+            cov[:,:,l] = (diffs.t() @ diffs) / max(1, N-1)
+            cov[:,:,l] += self.ridge * torch.eye(d)
+        self.mean = mean.numpy().astype(np.float32)
+        self.cov = cov.numpy().astype(np.float32)
+
+    def predict(self, tile):
+        emb = self._extract_embedding(tile)  # (d, L)
+        mean = self.mean
+        cov = self.cov
+        d, L = emb.shape
+        dist2 = np.zeros((L,), dtype=np.float32)
+        TILE = 256
+        for l0 in range(0, L, TILE):
+            l1_ = min(l0 + TILE, L)
+            t = l1_ - l0
+            diffs = emb[:, l0:l1_].T - mean[:, l0:l1_].T  # (t, d)
+            cov_t = np.transpose(cov[:, :, l0:l1_], (2, 0, 1)).copy()  # (t, d, d)
+            eps = 1e-2
+            cov_t += eps * np.eye(d, dtype=np.float32)[None, :, :]
+            cov_t_t = torch.from_numpy(cov_t)
+            diffs_t = torch.from_numpy(diffs)
+            Lfac = torch.linalg.cholesky(cov_t_t)
+            diffsT = diffs_t.transpose(0,1).unsqueeze(2)  # (d, t, 1)
+            sol = torch.cholesky_solve(diffsT, Lfac)
+            dist2_t = (diffsT.squeeze(2) * sol.squeeze(2)).sum(dim=0)
+            dist2[l0:l1_] = dist2_t.cpu().numpy().astype(np.float32)
+        dist_arr = np.sqrt(dist2).reshape(self.H, self.W)
+        # upsample + gaussian
+        dist_t = torch.from_numpy(dist_arr).unsqueeze(0).unsqueeze(0)
+        score_map = F.interpolate(dist_t, size=self.img_size, mode='bilinear', align_corners=False).squeeze().numpy()
+        if self.gaussian_sigma > 0:
+            score_map = gaussian_filter(score_map, sigma=self.gaussian_sigma)
+        score_map = (score_map - score_map.min()) / (score_map.max() - score_map.min() + 1e-8)
+        return score_map
 
 
 def main():
