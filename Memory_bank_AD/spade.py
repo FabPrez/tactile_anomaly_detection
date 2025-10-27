@@ -31,17 +31,17 @@ from ad_analysis import run_pixel_level_evaluation, print_pixel_report
 
 # ----------------- CONFIG -----------------
 METHOD = "SPADE"
-CODICE_PEZZO = "PZ1"
+CODICE_PEZZO = "PZ5"
 
 # Posizioni "good" usate per il TRAIN (feature bank).
 # Puoi passare una stringa ("pos1") oppure una lista (["pos1","pos2"]).
-TRAIN_POSITIONS = ["pos1","pos2","pos3"]
+TRAIN_POSITIONS = ["pos1"]
 
 # Quanti GOOD per posizione spostare nella VALIDATION (e quindi togliere dal TRAIN).
 # Può essere:
 #   - int (stesso valore per tutte le pos del VAL_GOOD_SCOPE)
 #   - dict per-posizione, es: {"pos1": 10, "pos2": 30}
-VAL_GOOD_PER_POS = 20
+VAL_GOOD_PER_POS = 0
 # Esempio alternativo:
 # VAL_GOOD_PER_POS = {"pos1": 10, "pos2": 30}
 
@@ -49,15 +49,15 @@ VAL_GOOD_PER_POS = 20
 #   "from_train"     -> solo dalle pos di TRAIN_POSITIONS
 #   "all_positions"  -> da tutte le pos disponibili
 #   ["pos1","pos3"]  -> lista custom
-VAL_GOOD_SCOPE = ["pos1","pos2","pos3"]
+VAL_GOOD_SCOPE = ["pos1"]
 
 # Da quali posizioni prendere le FAULT per la VALIDATION:
 #   "train_only" | "all" | lista custom (es. ["pos1","pos2"])
-VAL_FAULT_SCOPE = ["pos1","pos2","pos3"]
+VAL_FAULT_SCOPE = ["pos1"]
 
 # Percentuale di GOOD (rimasti dopo aver tolto quelli per la val) da usare nel TRAIN.
 # 1.0 = 100%, 0.1 = 10%, ecc. Questa percentuale entra nel tag dei pickle come "@pXX".
-GOOD_FRACTION = 0.30
+GOOD_FRACTION = 1.0
 
 # Modello / dati
 TOP_K    = 5
