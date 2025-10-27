@@ -34,14 +34,14 @@ class GelSightCapture:
         self.marker_mask_min = marker_mask_min
         self.marker_mask_max = marker_mask_max
 
-        self.cam = GelSightMini(target_width=camera_width, target_height=camera_height)
+        self.cam = GelSightMini(target_width=self.camera_width, target_height=self.camera_height)
         self.cam.select_device(device_idx=camera_index)
         self.cam.start()
         self.model_path = model_path
 
         self.reconstruction = Reconstruction3D(
-            image_width=camera_width,
-            image_height=camera_height,
+            image_width=self.camera_width,
+            image_height=self.camera_heighta_height,
             use_gpu=use_gpu
         )
 
