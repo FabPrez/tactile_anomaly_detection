@@ -1,4 +1,4 @@
-# InReach_fast.py — InReaCh ufficiale ottimizzato (build channels batched+AMP, FAISS GPU, I/O opzionale)
+# InReach_fast.py — InReaCh ufficiale ottimizzato (build channels batched+AMP, FAISS GPU con fallback, I/O opzionale)
 
 import os, random
 from dataclasses import dataclass
@@ -19,7 +19,7 @@ from ad_analysis import run_pixel_level_evaluation, print_pixel_report
 # Switch di I/O (cache)
 # ------------------------------------------------------------
 PERSIST_FEATURES  = True   # salva/carica F_tr, F_val
-PERSIST_BANK      = True   # salva/carica bank npz
+PERSIST_BANK      = False   # salva/carica bank npz
 PERSIST_CHANNELS  = False  # salva/carica channels npz (disattivato per velocità)
 
 torch.backends.cudnn.benchmark = True
@@ -56,15 +56,14 @@ CORESET_IMGS   = "ALL"
 # Matching locale per canali
 SEARCH_RAD     = 1                # 3x3
 SIM_MIN        = 0.0
-STRIDE_H       = 1
+STRIDE_H       = 1                # puoi alzare a 2 per ridurre 4x il bank
 STRIDE_W       = 1
-
 # Filtri canale
 SPAN_MIN       = 0.0
 SPREAD_MAX     = float("inf")
 
 # Limite opzionale patch per canale (RAM). None = no limit
-BANK_PER_CHANNEL_LIMIT = None
+BANK_PER_CHANNEL_LIMIT = None     # es. 128 per ridurre RAM/VRAM
 
 # Costruzione canali (performance)
 BATCH_J        = 48               # immagini train per blocco durante build channels
@@ -122,6 +121,23 @@ def kcenter_coreset(X: np.ndarray, m, device: torch.device):
         c = Xt[idx:idx+1]
         dmin = torch.minimum(dmin, torch.cdist(Xt, c).squeeze(1))
     return np.array(sel, dtype=np.int64)
+
+# ========= Utility VRAM per FAISS GPU fallback =========
+def _free_vram_bytes() -> int:
+    if not torch.cuda.is_available():
+        return 0
+    free_bytes, _ = torch.cuda.mem_get_info()
+    return int(free_bytes)
+
+def _should_use_faiss_gpu_for_bank(bank_cpu: torch.Tensor, safety: float = 0.6) -> bool:
+    """
+    Ritorna True se il bank (float32) entra in VRAM con un margine di sicurezza.
+    Stima memoria: M*C*4 byte. Se non c'è GPU/FAISS, restituisce False.
+    """
+    if not (_FAISS_OK and torch.cuda.is_available()):
+        return False
+    need = bank_cpu.shape[0] * bank_cpu.shape[1] * 4  # float32
+    return need < int(safety * _free_vram_bytes())
 
 # ================== CHANNELS ==================
 @dataclass
@@ -305,16 +321,23 @@ def score_image_nn_faiss(
     tile_q: int = TILE_Q
 ) -> torch.Tensor:
     C, Hf, Wf = F_img.shape
-    Q = F_img.permute(1,2,0).reshape(-1, C).contiguous().cpu().numpy().astype(np.float32)  # (L,C)
-    B = bank_cpu.contiguous().cpu().numpy().astype(np.float32)                              # (M,C)
+    Q = F_img.permute(1,2,0).reshape(-1, C).contiguous().cpu().numpy().astype(np.float32)
+
+    # Evita copie superflue: se già float32 lascia stare
+    if bank_cpu.dtype != torch.float32:
+        bank_cpu = bank_cpu.float()
+    B = bank_cpu.contiguous().cpu().numpy()  # niente .astype(np.float32) per non raddoppiare RAM
 
     cpu_index = faiss.IndexFlatL2(C)
-    use_gpu = faiss.get_num_gpus() > 0
+
+    # Usa la GPU solo se il bank entra in VRAM (margine di sicurezza)
+    use_gpu = _should_use_faiss_gpu_for_bank(bank_cpu)
     if use_gpu:
         res = faiss.StandardGpuResources()
         index = faiss.index_cpu_to_gpu(res, 0, cpu_index)
     else:
         index = cpu_index
+
     index.add(B)  # build
 
     L = Q.shape[0]

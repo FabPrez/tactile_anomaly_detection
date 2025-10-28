@@ -21,13 +21,13 @@ from ad_analysis import run_pixel_level_evaluation, print_pixel_report
 
 # ----------------- CONFIG -----------------
 METHOD = "SPADE"
-CODICE_PEZZO = "PZ3"
+CODICE_PEZZO = "PZ4"
 
-TRAIN_POSITIONS = ["pos2"]
+TRAIN_POSITIONS = ["pos1"]
 VAL_GOOD_PER_POS = 20
-VAL_GOOD_SCOPE = ["pos2"]
-VAL_FAULT_SCOPE = ["pos2"]
-GOOD_FRACTION = 0.3
+VAL_GOOD_SCOPE = ["pos1"]
+VAL_FAULT_SCOPE = ["pos1"]
+GOOD_FRACTION = 1.0
 SEED = 42
 
 # Backbone input size
@@ -35,7 +35,7 @@ BACKBONE_IMG_SIZE = 224
 
 # --- Griglia: CONTEGGIO FISSO ---
 FIXED_ROWS = 2           # es.: 2 righe
-FIXED_COLS = 2           # es.: 2 colonne  -> 4 tile
+FIXED_COLS = 3           # es.: 2 colonne  -> 4 tile
 FIXED_OVERLAP = 0        # overlap opzionale (0, 16, 32, ...)
 
 # Visual/valutazione
