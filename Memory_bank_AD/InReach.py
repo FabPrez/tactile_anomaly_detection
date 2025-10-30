@@ -1,514 +1,532 @@
-# InReach_fast.py — InReaCh ufficiale ottimizzato (build channels batched+AMP, FAISS GPU con fallback, I/O opzionale)
+# InReach.py — InReaCh "repo-faithful" adattato al tuo dataset
+# Dipendenze: torch, torchvision, faiss-cpu (o faiss-gpu), numpy, scipy, sklearn, tqdm
+# Usa le tue utility: data_loader (build_ad_datasets, make_loaders), ad_analysis, view_utils
 
-import os, random
-from dataclasses import dataclass
-from typing import List, Tuple, Optional
+import os, math, random, time
+from typing import List, Dict, Tuple, Optional
 import numpy as np
 from tqdm import tqdm
 
 import torch
 import torch.nn.functional as F
-from torchvision.models import wide_resnet50_2, Wide_ResNet50_2_Weights
+from sklearn.metrics import roc_auc_score, roc_curve, confusion_matrix
 from scipy.ndimage import gaussian_filter
-from sklearn.metrics import roc_curve, roc_auc_score, confusion_matrix
 
-from data_loader import build_ad_datasets, make_loaders, load_split_pickle, save_split_pickle
+# --- tue utility ---
+from data_loader import build_ad_datasets, make_loaders
+from view_utils import show_dataset_images, show_validation_grid_from_loader
 from ad_analysis import run_pixel_level_evaluation, print_pixel_report
 
-# ------------------------------------------------------------
-# Switch di I/O (cache)
-# ------------------------------------------------------------
-PERSIST_FEATURES  = True   # salva/carica F_tr, F_val
-PERSIST_BANK      = False   # salva/carica bank npz
-PERSIST_CHANNELS  = False  # salva/carica channels npz (disattivato per velocità)
-
-torch.backends.cudnn.benchmark = True
-
-# ===== FAISS availability =====
-USE_FAISS = True
-_FAISS_OK = False
+# --- FAISS ---
 try:
     import faiss
-    _FAISS_OK = True
-except Exception:
-    _FAISS_OK = False
+except Exception as e:
+    raise ImportError("InReaCh richiede FAISS. Installa: pip install faiss-cpu (oppure conda: faiss-cpu/faiss-gpu).") from e
 
-# ===== config =====
-METHOD        = "INREACH_OFFICIAL"
-CODICE_PEZZO  = "PZ3"
+# forza default su float32 per sicurezza
+torch.set_default_dtype(torch.float32)
 
-TRAIN_POSITIONS   = ["pos2"]
-VAL_GOOD_PER_POS  = 0
-VAL_GOOD_SCOPE    = ["pos2"]
-VAL_FAULT_SCOPE   = ["pos2"]
-GOOD_FRACTION     = 1.0
+# ---------------- CONFIG ----------------
+METHOD = "INREACH_OFFICIAL"
+CODICE_PEZZO = "PZ3"
 
-IMG_SIZE    = 224
-SEED        = 42
-DEVICE      = "cuda" if torch.cuda.is_available() else "cpu"
+TRAIN_POSITIONS = ["pos2"]
+VAL_GOOD_PER_POS = 0
+VAL_GOOD_SCOPE   = ["pos2"]     # "from_train" | "all_positions" | lista
+VAL_FAULT_SCOPE  = ["pos2"]     # "train_only" | "all" | lista
+GOOD_FRACTION    = 1.0
 
-# Backbone/layer
-FEATURE_LAYER = "layer2"          # hook a layer2[-1]
+IMG_SIZE  = 224
+SEED      = 42
 
-# Coreset immagini (ancore). "ALL" = tutte (come paper/repo)
-CORESET_IMGS   = "ALL"
+# InReaCh (repo)
+ASSOC_DEPTH        = 10
+MIN_CHANNEL_LENGTH = 3
+MAX_CHANNEL_STD    = 5.0              # pruning soglia
+FILTER_SIZE        = 13               # smooth finale per mappa
 
-# Matching locale per canali
-SEARCH_RAD     = 1                # 3x3
-SIM_MIN        = 0.0
-STRIDE_H       = 1                # puoi alzare a 2 per ridurre 4x il bank
-STRIDE_W       = 1
-# Filtri canale
-SPAN_MIN       = 0.0
-SPREAD_MAX     = float("inf")
+# k-NN (repo-faithful): k=1
+KNN_K = 1
 
-# Limite opzionale patch per canale (RAM). None = no limit
-BANK_PER_CHANNEL_LIMIT = None     # es. 128 per ridurre RAM/VRAM
+# Visual
+VIS_VALID_DATASET               = False
+VIS_PREDICTION_ON_VALID_DATASET = True
 
-# Costruzione canali (performance)
-BATCH_J        = 48               # immagini train per blocco durante build channels
-USE_AMP        = True             # mixed precision su GPU
+# ---------------- Utils ----------------
+def super_seed(seed: int):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+    torch.use_deterministic_algorithms(True)
+    random.seed(seed)
+    np.random.seed(seed)
 
-# Inference NN L2
-TILE_Q         = 65536            # query per batch (FAISS)
-TILE_B         = 20000            # chunk bank per torch.cdist
-GAUSS_SIGMA    = 2.0
+def _tensor_batch_to_uint8_images(x: torch.Tensor) -> List[np.ndarray]:
+    x = x.detach().cpu()
+    if x.dtype != torch.uint8:
+        x = (x.clamp(0, 1) * 255.0).to(torch.uint8)
+    return [im for im in x.permute(0, 2, 3, 1).numpy()]
 
-# Logging
-def _p(*a, **k):
-    print(*a, **k)
+def _tensor_batch_to_uint8_masks(m: torch.Tensor) -> List[np.ndarray]:
+    m = m.detach().cpu()
+    if m.ndim == 3:
+        m = m.unsqueeze(-1)
+    if m.dtype != torch.uint8:
+        m = (m > 0).to(torch.uint8) * 255
+    return [mk for mk in m.numpy()]
 
-# ================== UTIL BASE ==================
-def l2norm(x, dim=1, eps=1e-6):
-    return x / (x.norm(dim=dim, keepdim=True) + eps)
-
-def get_backbone(device):
-    m = wide_resnet50_2(weights=Wide_ResNet50_2_Weights.IMAGENET1K_V1).to(device)
-    m.eval()
-    outs = []
-    def hook(_m,_i,o): outs.append(o)
-    m.layer2[-1].register_forward_hook(hook)  # feature intermedie
-    m.avgpool.register_forward_hook(hook)     # globali per (eventuale) coreset
-    return m, outs
-
-@torch.no_grad()
-def extract_features(model, outs, loader, device):
-    Fs, Gs = [], []
-    for x,_,_ in tqdm(loader, desc="feature extraction", leave=False):
-        _ = model(x.to(device, non_blocking=True))
-        layer2, avg = outs[0], outs[1]; outs.clear()
-        Fs.append(layer2.detach().cpu())               # (B,C,H,W)
-        Gs.append(avg.detach().cpu())                  # (B,2048,1,1)
-    F = torch.cat(Fs, 0)                               # (N,C,H,W)
-    G = torch.flatten(torch.cat(Gs, 0), 1)             # (N,2048)
-    return F, G
-
-@torch.no_grad()
-def kcenter_coreset(X: np.ndarray, m, device: torch.device):
-    # m == "ALL" -> tutti gli indici (purista)
-    N = X.shape[0]
-    if m == "ALL" or (isinstance(m, int) and m >= N):
-        return np.arange(N, dtype=np.int64)
-    # Greedy k-center (se vuoi campionare davvero)
-    rng = np.random.default_rng(1234)
-    sel = [int(rng.integers(0, N))]
-    Xt = torch.from_numpy(X).to(device)
-    centers = Xt[sel[-1]:sel[-1]+1]
-    dmin = torch.cdist(Xt, centers).squeeze(1)
-    for _ in tqdm(range(1, m), desc="coreset imgs", leave=False):
-        idx = int(torch.argmax(dmin).item())
-        sel.append(idx)
-        c = Xt[idx:idx+1]
-        dmin = torch.minimum(dmin, torch.cdist(Xt, c).squeeze(1))
-    return np.array(sel, dtype=np.int64)
-
-# ========= Utility VRAM per FAISS GPU fallback =========
-def _free_vram_bytes() -> int:
-    if not torch.cuda.is_available():
-        return 0
-    free_bytes, _ = torch.cuda.mem_get_info()
-    return int(free_bytes)
-
-def _should_use_faiss_gpu_for_bank(bank_cpu: torch.Tensor, safety: float = 0.6) -> bool:
+def build_2d_sincos_pos_embed(H: int, W: int, dim: int, temperature: float = 10000.0) -> np.ndarray:
     """
-    Ritorna True se il bank (float32) entra in VRAM con un margine di sicurezza.
-    Stima memoria: M*C*4 byte. Se non c'è GPU/FAISS, restituisce False.
+    PE 2D sinusoidale: genera (H*W, dim) da concatenare alle feature.
     """
-    if not (_FAISS_OK and torch.cuda.is_available()):
-        return False
-    need = bank_cpu.shape[0] * bank_cpu.shape[1] * 4  # float32
-    return need < int(safety * _free_vram_bytes())
+    assert dim % 2 == 0, "Usa dim pari per i PE"
+    grid_y, grid_x = np.meshgrid(np.arange(H), np.arange(W), indexing='ij')  # (H,W)
+    omega = np.arange(dim // 2, dtype=np.float32) / (dim // 2)
+    omega = 1. / (temperature ** omega)  # (dim/2,)
 
-# ================== CHANNELS ==================
-@dataclass
-class ChannelMeta:
-    h: int
-    w: int
-    span: float
-    spread: float
+    out_y = np.einsum('hw,c->hwc', grid_y.astype(np.float32), omega)  # (H,W,dim/2)
+    out_x = np.einsum('hw,c->hwc', grid_x.astype(np.float32), omega)  # (H,W,dim/2)
 
-def compute_spread(stack: torch.Tensor) -> float:
-    mu = stack.mean(dim=0)
-    dif = stack - mu
-    cov = (dif.t() @ dif) / max(1, stack.shape[0]-1)
-    return float((torch.trace(cov) / cov.shape[0]).item())
-
-@torch.no_grad()
-def build_channels(
-    F_train: torch.Tensor,              # (N,C,H,W) L2-normalized on channels, on device
-    img_anchors: np.ndarray,
-    search_rad: int = 1,
-    stride_h: int = 1, stride_w: int = 1,
-    sim_min: float = 0.0,
-    span_min: float = 0.0,
-    spread_max: float = float("inf"),
-    per_channel_limit: Optional[int] = None,
-    batch_j: int = BATCH_J,
-) -> Tuple[List[ChannelMeta], torch.Tensor]:
-
-    if isinstance(img_anchors, np.ndarray):
-        img_anchors = torch.from_numpy(img_anchors).long()
-
-    device = F_train.device
-    N, C, H, W = F_train.shape
-    ksize = 2*search_rad + 1
-    pad = search_rad
-
-    # griglia con stride
-    hs = torch.arange(0, H, device=device, dtype=torch.long)[::stride_h]
-    ws = torch.arange(0, W, device=device, dtype=torch.long)[::stride_w]
-    Hs, Ws = torch.meshgrid(hs, ws, indexing="ij")
-    coords = torch.stack([Hs.reshape(-1), Ws.reshape(-1)], 1)     # (L,2)
-    L = coords.shape[0]
-
-    # indici lineari (stride=1) -> sotto-campionati via (hs,ws)
-    lin_ids_full = (torch.arange(H, device=device).unsqueeze(1) * W +
-                    torch.arange(W, device=device))               # (H,W)
-    l_ids = lin_ids_full[hs][:, ws].reshape(-1)                   # (L,)
-
-    chans: List[ChannelMeta] = []
-    bank_chunks: List[torch.Tensor] = []
-    use_amp = USE_AMP and (device.type == "cuda")
-
-    for ia in tqdm(img_anchors.tolist(), desc="build channels", leave=False):
-        A = F_train[ia]  # (C,H,W)
-        # vettori ancora alle posizioni (stride)
-        A_vecs = A.permute(1,2,0)[hs][:, ws, :].reshape(-1, C).contiguous()  # (L,C)
-
-        per_pos_acc = [[] for _ in range(L)]
-
-        for j0 in range(0, N, batch_j):
-            j1 = min(j0 + batch_j, N)
-            Y = F_train[j0:j1]  # (B,C,H,W)
-
-            with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=use_amp):
-                patches = F.unfold(Y, kernel_size=ksize, padding=pad, stride=1)    # (B, C*K, H*W)
-                patches_sel = patches[:, :, l_ids]                                 # (B, C*K, L)
-                patches_sel = patches_sel.view(Y.size(0), C, ksize*ksize, L)       # (B, C, K, L)
-                PS = patches_sel.permute(0, 3, 1, 2).contiguous()                  # (B, L, C, K)
-
-                # dot per ogni (b,l,k): <A_vecs[l], PS[b,l,:,k]> -> (B,L,K)
-                sims = torch.einsum('lc,blck->blk', A_vecs.to(PS.dtype), PS)       # (B, L, K)
-                vals, argk = sims.max(dim=2)                                       # (B, L)
-
-            valid_mask = (vals >= sim_min)                                         # (B, L)
-
-            # gather vettore migliore mantenendo K=1
-            idx = argk.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, C, 1)            # (B, L, C, 1)
-            best_vecs = torch.gather(PS, dim=3, index=idx).squeeze(-1)             # (B, L, C)
-
-            # Accumulo CPU (float32) per ciascuna posizione l
-            for b in range(j1 - j0):
-                vm = valid_mask[b]
-                if vm.any():
-                    l_valid = torch.nonzero(vm, as_tuple=False).squeeze(1).tolist()
-                    bv = best_vecs[b].float().cpu()                                 # (L,C)
-                    for l_id in l_valid:
-                        per_pos_acc[l_id].append(bv[l_id:l_id+1])                   # (1,C)
-
-            # cleanup
-            del Y, patches, patches_sel, PS, sims, vals, argk, valid_mask, idx, best_vecs
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
-
-        # Valutazione/filtro canale
-        for l_id, acc_list in enumerate(per_pos_acc):
-            if not acc_list:
-                continue
-            span = len(acc_list) / float(N)
-            if span < span_min:
-                continue
-
-            stack = torch.cat(acc_list, dim=0)          # (valid, C) CPU float32
-            spr = compute_spread(stack)
-            if spr > spread_max:
-                continue
-
-            if per_channel_limit is not None and stack.shape[0] > per_channel_limit:
-                sel = torch.randperm(stack.shape[0])[:per_channel_limit]
-                stack = stack[sel]
-
-            bank_chunks.append(stack)
-            h, w = int(coords[l_id, 0].item()), int(coords[l_id, 1].item())
-            chans.append(ChannelMeta(h=h, w=w, span=float(span), spread=float(spr)))
-
-        del A, A_vecs, per_pos_acc
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
-
-    bank = torch.cat(bank_chunks, dim=0).contiguous() if bank_chunks else torch.empty((0, C), dtype=torch.float32)
-    return chans, bank
-
-# ================== NOMINAL MODEL I/O ==================
-def _features_dir_for(part: str, train_tag: str) -> str:
-    base = os.path.join(os.path.dirname(__file__), "Dataset", part, "features", train_tag)
-    os.makedirs(base, exist_ok=True)
-    return base
-
-def save_channels_npz(chans: List[ChannelMeta], part: str, train_tag: str, method: str):
-    if not PERSIST_CHANNELS:
-        return None
-    d = _features_dir_for(part, train_tag)
-    path = os.path.join(d, f"{method.lower()}_channels_train.npz")
-    if len(chans) == 0:
-        np.savez_compressed(path, h=np.zeros((0,), np.int16), w=np.zeros((0,), np.int16),
-                            span=np.zeros((0,), np.float16), spread=np.zeros((0,), np.float16))
+    pe = np.concatenate([np.sin(out_y), np.cos(out_y), np.sin(out_x), np.cos(out_x)], axis=-1)  # (H,W,dim*2)
+    if pe.shape[-1] >= dim:
+        pe = pe[..., :dim]
     else:
-        h = np.array([c.h for c in chans], dtype=np.int16)
-        w = np.array([c.w for c in chans], dtype=np.int16)
-        span = np.array([c.span for c in chans], dtype=np.float16)
-        spread = np.array([c.spread for c in chans], dtype=np.float16)
-        np.savez_compressed(path, h=h, w=w, span=span, spread=spread)
-    return path
+        pad = dim - pe.shape[-1]
+        pe = np.pad(pe, ((0,0),(0,0),(0,pad)), mode='constant')
+    pe = pe.reshape(H*W, dim).astype(np.float32, copy=False)
+    return pe
 
-def load_channels_npz(part: str, train_tag: str, method: str) -> List[ChannelMeta]:
-    if not PERSIST_CHANNELS:
-        raise FileNotFoundError("channels cache disabled")
-    d = _features_dir_for(part, train_tag)
-    path = os.path.join(d, f"{method.lower()}_channels_train.npz")
-    if not os.path.exists(path):
-        raise FileNotFoundError(path)
-    data = np.load(path)
-    h = data["h"].astype(np.int32); w = data["w"].astype(np.int32)
-    span = data["span"].astype(np.float32); spread = data["spread"].astype(np.float32)
-    chans = [ChannelMeta(h=int(h[i]), w=int(w[i]), span=float(span[i]), spread=float(spread[i])) for i in range(h.shape[0])]
-    return chans
+# ---------------- MODEL ----------------
+from torchvision.models.feature_extraction import create_feature_extractor
+from torchvision.models import wide_resnet50_2, Wide_ResNet50_2_Weights
 
-def save_bank_npz(bank: torch.Tensor, part: str, train_tag: str, method: str):
-    if not PERSIST_BANK:
-        return None
-    d = _features_dir_for(part, train_tag)
-    path = os.path.join(d, f"{method.lower()}_bank_train.npz")
-    np.savez_compressed(path, bank=bank.numpy().astype(np.float16))
-    return path
+def load_wide_resnet_50(return_nodes: Dict[str, str] = None):
+    try:
+        model = wide_resnet50_2(weights=Wide_ResNet50_2_Weights.IMAGENET1K_V1)
+    except Exception:
+        model = wide_resnet50_2(weights=None)
+    if return_nodes is not None:
+        model = create_feature_extractor(model, return_nodes=return_nodes)
+    if torch.cuda.is_available():
+        model = model.cuda()
+    model.eval()
+    return model
 
-def load_bank_npz(part: str, train_tag: str, method: str) -> torch.Tensor:
-    if not PERSIST_BANK:
-        raise FileNotFoundError("bank cache disabled")
-    d = _features_dir_for(part, train_tag)
-    path = os.path.join(d, f"{method.lower()}_bank_train.npz")
-    if not os.path.exists(path):
-        raise FileNotFoundError(path)
-    data = np.load(path)
-    B = torch.from_numpy(data["bank"].astype(np.float32))   # (M,C) CPU
-    return B
+# ---------------- Feature Descriptors (repo-faithful) ----------------
+class PatchMaker:
+    def __init__(self, patchsize: int = 3, stride: int = 1):
+        self.patchsize = patchsize
+        self.stride = stride
 
-# ================== SCORING (NN L2) ==================
-@torch.no_grad()
-def score_image_nn_faiss(
-    F_img: torch.Tensor,      # (C,Hf,Wf) L2-normalized on channels (device-agnostic)
-    bank_cpu: torch.Tensor,   # (M,C) CPU float32
-    tile_q: int = TILE_Q
-) -> torch.Tensor:
-    C, Hf, Wf = F_img.shape
-    Q = F_img.permute(1,2,0).reshape(-1, C).contiguous().cpu().numpy().astype(np.float32)
+    def patchify(self, feat: torch.Tensor, return_hw=False):
+        """
+        feat: (B, C, H, W) -> (B, L, C, ps, ps), con padding 'same' per stride=1
+        """
+        ps = self.patchsize
+        pad = (ps - 1) // 2
+        unfolder = torch.nn.Unfold(kernel_size=ps, stride=self.stride, padding=pad, dilation=1)
+        unfolded = unfolder(feat)                     # (B, C*ps*ps, L)
+        B, _, L = unfolded.shape
+        C = feat.size(1)
+        unfolded = unfolded.reshape(B, C, ps, ps, L)  # (B, C, ps, ps, L)
+        unfolded = unfolded.permute(0, 4, 1, 2, 3)    # (B, L, C, ps, ps)
 
-    # Evita copie superflue: se già float32 lascia stare
-    if bank_cpu.dtype != torch.float32:
-        bank_cpu = bank_cpu.float()
-    B = bank_cpu.contiguous().cpu().numpy()  # niente .astype(np.float32) per non raddoppiare RAM
+        H = (feat.size(-2) + 2*pad - (ps - 1) - 1) // self.stride + 1
+        W = (feat.size(-1) + 2*pad - (ps - 1) - 1) // self.stride + 1
 
-    cpu_index = faiss.IndexFlatL2(C)
+        if return_hw:
+            return unfolded, (H, W)
+        return unfolded
 
-    # Usa la GPU solo se il bank entra in VRAM (margine di sicurezza)
-    use_gpu = _should_use_faiss_gpu_for_bank(bank_cpu)
-    if use_gpu:
-        res = faiss.StandardGpuResources()
-        index = faiss.index_cpu_to_gpu(res, 0, cpu_index)
-    else:
-        index = cpu_index
+class FeatureDescriptor(torch.nn.Module):
+    """
+    Pipeline:
+      - estrai più livelli WRN
+      - patchify ogni livello
+      - riallinea ogni livello (L_i -> L_ref) con bilinear su griglia (H_ref, W_ref)
+      - concatena TUTTI i livelli + PE 2D
+      - proiezione con adaptive avg pool a target_dim
+      - ritorna (D, L) per immagine
+    """
+    def __init__(self,
+                 backbone: torch.nn.Module,
+                 return_nodes_keys_in_order: List[str],
+                 target_embed_dimension: int = 1024,
+                 agg_patch_kernel: int = 3,
+                 agg_patch_stride: int = 1,
+                 pos_embed_dim: int = 64,  # PE 2D
+                 use_positional_embeddings: bool = True):
+        super().__init__()
+        self.model = backbone
+        self.nodes = return_nodes_keys_in_order  # <<-- lista delle OUTPUT-keys
+        self.target_dim = target_embed_dimension
+        self.pm = PatchMaker(patchsize=agg_patch_kernel, stride=agg_patch_stride)
+        self.use_pe = use_positional_embeddings
+        self.pos_dim = pos_embed_dim
 
-    index.add(B)  # build
+    def _imagenet_norm(self, img_uint8: np.ndarray, device):
+        x = img_uint8.astype(np.float32) / 255.0
+        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+        std  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+        x = (x - mean) / std
+        x = np.transpose(x, (2, 0, 1))[None, ...]  # (1,3,H,W)
+        return torch.from_numpy(x).to(device=device, dtype=torch.float32)
 
-    L = Q.shape[0]
-    out = np.empty((L,), dtype=np.float32)
-    for q0 in range(0, L, tile_q):
-        q1 = min(q0 + tile_q, L)
-        D, _ = index.search(Q[q0:q1], k=1)  # D: (lq, 1)
-        out[q0:q1] = D[:, 0]
+    @torch.no_grad()
+    def forward_single(self, img_uint8: np.ndarray) -> torch.Tensor:
+        device = next(self.model.parameters()).device
+        x = self._imagenet_norm(img_uint8, device)
+        feats_dict = self.model(x)  # dict {out_key: (1,C,H,W)}
+        # Ordina i livelli come in return_nodes_keys_in_order (OUTPUT-keys)
+        try:
+            feats = [feats_dict[k].to(torch.float32) for k in self.nodes]
+        except KeyError as e:
+            raise KeyError(f"Chiave di output '{e.args[0]}' non presente. "
+                           f"Assicurati di passare le OUTPUT-keys (list(return_nodes.values())).")
 
-    if use_gpu:
-        faiss.index_gpu_to_cpu(index)
+        # Patchify ogni livello e tieni HW di ciascuna griglia patch
+        patch_list = []
+        hw_list = []
+        for f in feats:
+            pf, hw = self.pm.patchify(f, return_hw=True)  # (1, L_i, C, ps, ps), (H_i,W_i)
+            patch_list.append(pf)                         # (1, L_i, C, ps, ps)
+            hw_list.append(hw)
 
-    return torch.from_numpy(out.reshape(Hf, Wf))  # CPU
+        # Griglia di riferimento = quella del primo livello
+        Href, Wref = hw_list[0]
 
-@torch.no_grad()
-def score_image_nn_torch(
-    F_img: torch.Tensor,      # (C,Hf,Wf) L2-normalized on channels
-    bank_cpu: torch.Tensor,   # (M,C) CPU float32
-    tile_q: int = 4096,
-    tile_b: int = TILE_B,
-    device: torch.device = torch.device(DEVICE)
-) -> torch.Tensor:
-    C, Hf, Wf = F_img.shape
-    Q = F_img.permute(1,2,0).reshape(-1, C).to(device)  # (L,C)
-    out = torch.full((Q.shape[0],), float("inf"), dtype=torch.float32, device=device)
+        # Riallinea ogni livello alla griglia (Href, Wref) via bilinear
+        aligned_levels = []
+        for pf, (Hi, Wi) in zip(patch_list, hw_list):
+            # (1, L_i, C, ps, ps) -> (1, C, ps, ps, Hi, Wi)
+            pf6 = pf.reshape(1, Hi, Wi, pf.size(2), pf.size(3), pf.size(4)).permute(0, 3, 4, 5, 1, 2)
+            base = pf6.shape
+            pf2d = pf6.reshape(-1, 1, Hi, Wi)
+            pf2d = F.interpolate(pf2d, size=(Href, Wref), mode='bilinear', align_corners=False)
+            # back to (1, L_ref, C, ps, ps)
+            pf6r = pf2d.reshape(base[0], base[1], base[2], base[3], Href, Wref).permute(0, 4, 5, 1, 2, 3)
+            pf_lr = pf6r.reshape(1, Href*Wref, pf.size(2), pf.size(3), pf.size(4))  # (1, L_ref, C, ps, ps)
+            aligned_levels.append(pf_lr)
 
-    for q0 in range(0, Q.shape[0], tile_q):
-        q1 = min(q0 + tile_q, Q.shape[0])
-        q_blk = Q[q0:q1]  # (lq, C)
-        best = torch.full((q1-q0,), float("inf"), dtype=torch.float32, device=device)
+        # Per livello -> (L_ref, C*ps*ps)
+        levels_flat = []
+        for pf in aligned_levels:
+            Lref = pf.size(1)
+            levels_flat.append(pf.squeeze(0).reshape(Lref, -1))  # (L_ref, Fi)
 
-        for b0 in range(0, bank_cpu.shape[0], tile_b):
-            b1 = min(b0 + tile_b, bank_cpu.shape[0])
-            Bt = bank_cpu[b0:b1].to(device, non_blocking=True)  # (tb, C)
-            d = torch.cdist(q_blk, Bt)                          # (lq, tb)
-            m,_ = d.min(dim=1)
-            best = torch.minimum(best, m)
-            del Bt, d, m
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
+        # Concat tra livelli -> (L_ref, sum(Fi))
+        feats_cat = torch.cat(levels_flat, dim=1)  # (L_ref, Ftot)
 
-        out[q0:q1] = best
+        # Aggiungi PE 2D (sin/cos) concatenata
+        if self.use_pe and self.pos_dim > 0:
+            pe = build_2d_sincos_pos_embed(Href, Wref, self.pos_dim)  # (L_ref, pos_dim)
+            pe_t = torch.from_numpy(pe).to(feats_cat.device, dtype=torch.float32)
+            feats_cat = torch.cat([feats_cat, pe_t], dim=1)  # (L_ref, Ftot+pos_dim)
 
-    return out.view(Hf, Wf).cpu()
+        # Proiezione con adaptive avg pooling a target_dim
+        proj = F.adaptive_avg_pool1d(feats_cat.unsqueeze(1), self.target_dim).squeeze(1)  # (L_ref, D)
 
-# ================== MAIN ==================
+        # Rimappa a (D, L)
+        emb = proj.permute(1, 0).contiguous()  # (D, L_ref)
+        return emb
+
+    @torch.no_grad()
+    def generate_descriptors(self, images: List[np.ndarray], quiet: bool = False) -> torch.Tensor:
+        outs = []
+        for img in tqdm(images, ncols=100, desc='Gen Feature Descriptors', disable=quiet):
+            emb = self.forward_single(img)   # (D, L)
+            outs.append(emb.unsqueeze(0).cpu())
+        return torch.cat(outs, dim=0).to(torch.float32)  # (N, D, L)
+
+# ---------------- InReaCh (repo-faithful) ----------------
+class InReaCh:
+    def __init__(self,
+                 images: List[np.ndarray],
+                 model: torch.nn.Module,
+                 return_nodes_keys_in_order: List[str],
+                 assoc_depth: int = 10,
+                 min_channel_length: int = 3,
+                 max_channel_std: float = 5.0,
+                 filter_size: int = 13,
+                 use_positional_embeddings: bool = True,
+                 pos_embed_dim: int = 64):
+        self.images = images
+        self.model = model
+        self.assoc_depth = assoc_depth
+        self.min_channel_length = min_channel_length
+        self.max_channel_std = max_channel_std
+        self.filter_size = filter_size
+
+        # feature descriptor repo-faithful
+        self.fd = FeatureDescriptor(
+            backbone=model,
+            return_nodes_keys_in_order=return_nodes_keys_in_order,  # <<-- OUTPUT-keys
+            target_embed_dimension=1024,
+            agg_patch_kernel=3,
+            agg_patch_stride=1,
+            pos_embed_dim=pos_embed_dim,
+            use_positional_embeddings=use_positional_embeddings
+        )
+
+        # (N, D, L) train
+        self.train_patches = self.fd.generate_descriptors(self.images, quiet=False)  # torch.float32
+        self.train_np = self.train_patches.cpu().numpy().astype(np.float32, copy=False)
+        self._build_channels_and_index()
+
+    @staticmethod
+    def _measure_cdist_cols(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        # a: (D, La), b: (D, Lb) -> dist (La, Lb)
+        return torch.cdist(a.permute(1,0), b.permute(1,0))
+
+    def _mutual_assoc(self, tgt: torch.Tensor, src: torch.Tensor,
+                      tgt_idx: int, src_idx: int) -> np.ndarray:
+        """
+        Associazione reciproca (mutual NN) fra patch di due immagini.
+        Ritorna array (Ltgt, 5) con [idx_tgt, idx_src, dist, tgt_img, src_img] o inf se non reciproco.
+        """
+        device = tgt.device
+        La = tgt.size(1); Lb = src.size(1)
+        block = 1024
+        # min su colonne e righe
+        src_zero_min = torch.full((La,), float('inf'), device=device)
+        src_zero_arg = torch.zeros((La,), device=device, dtype=torch.long)
+        tgt_one_min  = torch.full((Lb,), float('inf'), device=device)
+        tgt_one_arg  = torch.zeros((Lb,), device=device, dtype=torch.long)
+
+        for xs in range(0, Lb, block):
+            for yt in range(0, La, block):
+                d = self._measure_cdist_cols(src[:, xs:xs+block], tgt[:, yt:yt+block])  # (Lb', La')
+                mins0, args0 = torch.min(d, dim=0)  # min per tgt-col
+                cond0 = src_zero_min[yt:yt+mins0.numel()] >= mins0
+                src_zero_arg[yt:yt+mins0.numel()] = torch.where(cond0, (args0 + xs), src_zero_arg[yt:yt+mins0.numel()])
+                src_zero_min[yt:yt+mins0.numel()] = torch.minimum(src_zero_min[yt:yt+mins0.numel()], mins0)
+
+                mins1, args1 = torch.min(d, dim=1)  # min per src-row
+                cond1 = tgt_one_min[xs:xs+mins1.numel()] >= mins1
+                tgt_one_arg[xs:xs+mins1.numel()] = torch.where(cond1, (args1 + yt), tgt_one_arg[xs:xs+mins1.numel()])
+                tgt_one_min[xs:xs+mins1.numel()] = torch.minimum(tgt_one_min[xs:xs+mins1.numel()], mins1)
+
+        src_idx_arr = src_zero_arg.long().cpu().numpy()
+        tgt_idx_arr = tgt_one_arg.long().cpu().numpy()
+        mins_tgt = tgt_one_min.detach().cpu().numpy().astype(np.float32)
+
+        out = np.ones((tgt_idx_arr.shape[0], 5), dtype=np.float32) * np.inf
+        for x in range(tgt_idx_arr.shape[0]):
+            if src_idx_arr[tgt_idx_arr[x]] == x:
+                out[x] = np.array([x, tgt_idx_arr[x], mins_tgt[x], tgt_idx, src_idx], dtype=np.float32)
+            else:
+                out[x] = np.array([np.inf, np.inf, mins_tgt[x], np.inf, np.inf], dtype=np.float32)
+        return out
+
+    def _build_channels_and_index(self):
+        """
+        Costruisce canali con mutua associazione seed→compare e fa pruning (std sferica).
+        Poi costruisce l'indice FAISS sui "nominal points".
+        """
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        N, D, L = self.train_patches.shape
+
+        assoc = np.ones((self.assoc_depth, N, L, 5), dtype=np.float32) * np.inf
+
+        # step 1: associazione reciproca seed vs immagini successive
+        for s in tqdm(range(min(self.assoc_depth, N)), ncols=100, desc="Associate To Channels"):
+            tgt = self.train_patches[s].to(device=device, dtype=torch.float32)  # (D,L)
+            for j in range(s + 1, N):
+                src = self.train_patches[j].to(device=device, dtype=torch.float32)
+                assoc[s, j] = self._mutual_assoc(tgt, src, s, j)
+
+        # step 2: scegli per (N,L) il seed con distanza minima lungo S (PATCH APPLICATA)
+        S, Ntot, Ltot, _ = assoc.shape
+        assert Ntot == N and Ltot == L
+        mins_idx = np.argmin(assoc[:, :, :, 2], axis=0).astype(np.int64)  # (N, L)
+        n_idx = np.arange(N)[:, None]                                     # (N,1)
+        l_idx = np.arange(L)[None, :]                                     # (1,L)
+        assoc_best = assoc[mins_idx, n_idx, l_idx, :]                      # (N, L, 5)
+
+        # step 3: crea canali
+        channels: Dict[str, List] = {}
+        for img_i in tqdm(range(N), ncols=100, desc="Create Channels"):
+            for p in range(L):
+                row = assoc_best[img_i, p]
+                if row[0] < np.inf:  # reciproco
+                    cname = f"{int(row[0])}_{int(row[3])}"  # patchId_seedImg
+                    if cname not in channels:
+                        # seed center
+                        seed_patch_vec = self.train_np[int(row[3]), :, int(row[0])]
+                        channels[cname] = [[seed_patch_vec, int(row[3]), int(row[0])]]
+                    # add src
+                    src_patch_vec = self.train_np[int(row[4]), :, int(row[1])]
+                    channels[cname].append([src_patch_vec, int(row[4]), int(row[1])])
+
+        # step 4: pruning canali (std sferica rispetto al centro medio)
+        nominal_points = []
+        for cname in tqdm(list(channels.keys()), ncols=100, desc="Filter Channels"):
+            clist = channels[cname]
+            if len(clist) > self.min_channel_length:
+                cpatch = np.array([c[0] for c in clist], dtype=np.float32)  # (m, D)
+                mean = np.mean(cpatch, axis=0, dtype=np.float32)
+                dists = np.sqrt(np.sum((cpatch - mean) ** 2, axis=1, dtype=np.float32)).astype(np.float32)
+                std = float(np.std(dists, axis=0, dtype=np.float32))
+                keep = [c for c, dist in zip(clist, dists) if dist < (self.max_channel_std * std + 1e-12)]
+                if len(keep) > self.min_channel_length:
+                    nominal_points += [np.asarray(c[0], dtype=np.float32) for c in keep]
+
+        if len(nominal_points) == 0:
+            raise RuntimeError("Dopo il pruning non restano nominal points. Aumenta ASSOC_DEPTH o MAX_CHANNEL_STD.")
+
+        base_np = np.array(nominal_points, dtype=np.float32, order="C")  # (Nbase, D)
+        d = int(base_np.shape[1])
+        if torch.cuda.is_available():
+            try:
+                self.nn = faiss.GpuIndexFlatL2(faiss.StandardGpuResources(), d, faiss.GpuIndexFlatConfig())
+            except Exception:
+                self.nn = faiss.IndexFlatL2(d)
+        else:
+            self.nn = faiss.IndexFlatL2(d)
+        self.nn.add(base_np.astype(np.float32, copy=False))
+
+    def predict(self, test_images: List[np.ndarray]) -> List[np.ndarray]:
+        """
+        Ritorna score maps (H_img, W_img) per ciascuna immagine di test.
+        """
+        test_desc = self.fd.generate_descriptors(test_images, quiet=False)  # (N, D, L)
+        outs = []
+        for i in tqdm(range(test_desc.size(0)), ncols=100, desc="Predicting On Images"):
+            q = torch.permute(test_desc[i], (1, 0)).contiguous().cpu().numpy().astype(np.float32)  # (L, D)
+            # kNN repo-faithful: k=1, senza L2-normalization
+            dist, _ = self.nn.search(q, KNN_K)  # (L,1)
+            dist1 = dist[:, 0].astype(np.float32, copy=False)
+
+            L = dist1.shape[0]
+            side = int(np.sqrt(L))
+            assert side * side == L, f"L={L} non quadrato; controlla allineamento griglia patch."
+            dist2d = dist1.reshape(side, side)
+
+            # Bilinear upsample fino alla risoluzione dell'immagine di input
+            Himg, Wimg = test_images[i].shape[:2]
+            dist2d_t = torch.from_numpy(dist2d)[None, None, ...].to(dtype=torch.float32)
+            dist_up = F.interpolate(dist2d_t, size=(Himg, Wimg), mode="bilinear", align_corners=False)[0,0].cpu().numpy()
+
+            outs.append(gaussian_filter(dist_up, self.filter_size).astype(np.float32, copy=False))
+        return outs
+
+# ---------------- MAIN ----------------
 def main():
-    torch.manual_seed(SEED); np.random.seed(SEED); random.seed(SEED)
-    device = torch.device(DEVICE)
+    super_seed(SEED)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("**device:", device)
 
-    # ===== DATA =====
     train_set, val_set, meta = build_ad_datasets(
-        part=CODICE_PEZZO, img_size=IMG_SIZE,
+        part=CODICE_PEZZO,
+        img_size=IMG_SIZE,
         train_positions=TRAIN_POSITIONS,
         val_fault_scope=VAL_FAULT_SCOPE,
         val_good_scope=VAL_GOOD_SCOPE,
         val_good_per_pos=VAL_GOOD_PER_POS,
         good_fraction=GOOD_FRACTION,
-        seed=SEED, transform=None
+        seed=SEED,
+        transform=None,
     )
     TRAIN_TAG = meta["train_tag"]
-    _p(f"Train GOOD: {meta['counts']['train_good']} | Val TOT: {meta['counts']['val_total']}")
+    print("[meta]", meta)
 
-    train_loader, val_loader = make_loaders(train_set, val_set, batch_size=16, device=device)
+    if VIS_VALID_DATASET:
+        show_dataset_images(val_set, batch_size=5, show_mask=True)
 
-    # ===== MODEL =====
-    model, outs = get_backbone(device)
+    print(f"Train GOOD (pos {meta['train_positions']}): {meta['counts']['train_good']}")
+    print(f"Val   GOOD: {meta['counts']['val_good']}")
+    print(f"Val  FAULT (pos {meta['val_fault_positions']}): {meta['counts']['val_fault']}")
+    print(f"Val  TOT: {meta['counts']['val_total']}")
 
-    # ===== FEATURE (TRAIN) =====
-    try:
-        if not PERSIST_FEATURES:
-            raise FileNotFoundError
-        payload = load_split_pickle(CODICE_PEZZO, TRAIN_TAG, split="train", method=METHOD)
-        F_tr = payload["F_tr"]; G_tr = payload["G_tr"]
-    except FileNotFoundError:
-        F_tr_raw, G_tr = extract_features(model, outs, train_loader, device)
-        F_tr = l2norm(F_tr_raw, dim=1).cpu()
-        if PERSIST_FEATURES:
-            save_split_pickle({"F_tr":F_tr, "G_tr":G_tr}, CODICE_PEZZO, TRAIN_TAG, split="train", method=METHOD)
+    train_loader, val_loader = make_loaders(train_set, val_set, batch_size=32, device=device)
 
-    # ===== IMAGE CORESEt =====
-    anchors = kcenter_coreset(G_tr.numpy().astype(np.float32), m=CORESET_IMGS, device=device)
-
-    # ===== BUILD CHANNELS + BANK =====
-    bank_loaded = False
-    try:
-        bank_cpu = load_bank_npz(CODICE_PEZZO, TRAIN_TAG, METHOD)
-        bank_loaded = True
-    except FileNotFoundError:
-        pass
-
-    if not bank_loaded:
-        F_tr_dev = F_tr.to(device)
-        chans, bank_cpu = build_channels(
-            F_train=F_tr_dev,
-            img_anchors=anchors,
-            search_rad=SEARCH_RAD,
-            stride_h=STRIDE_H, stride_w=STRIDE_W,
-            sim_min=SIM_MIN,
-            span_min=SPAN_MIN,
-            spread_max=SPREAD_MAX,
-            per_channel_limit=BANK_PER_CHANNEL_LIMIT,
-            batch_j=BATCH_J,
-        )
-        # opzionale: salva
-        save_channels_npz(chans, CODICE_PEZZO, TRAIN_TAG, METHOD)
-        save_bank_npz(bank_cpu, CODICE_PEZZO, TRAIN_TAG, METHOD)
-
-    if bank_cpu.shape[0] == 0:
-        raise RuntimeError("Nominal model (bank) vuoto: allenta filtri o controlla SEARCH_RAD/STRIDE.")
-
-    # ===== FEATURE (VAL) =====
-    try:
-        if not PERSIST_FEATURES:
-            raise FileNotFoundError
-        val_pack = load_split_pickle(CODICE_PEZZO, TRAIN_TAG, split="validation", method=METHOD)
-        F_val_raw, gt_list = val_pack["F_val_raw"], val_pack["labels"]
-    except FileNotFoundError:
-        F_val_raw, _ = extract_features(model, outs, val_loader, device)  # (Nv,C,Hf,Wf)
-        gt_list = []
-        for _, y, _ in val_loader: gt_list.extend(y.cpu().numpy())
-        if PERSIST_FEATURES:
-            save_split_pickle({"F_val_raw":F_val_raw, "labels": np.array(gt_list, dtype=np.int64)},
-                              CODICE_PEZZO, TRAIN_TAG, split="validation", method=METHOD)
-
-    F_val = l2norm(F_val_raw, dim=1).to(device)
-    _, C, Hf, Wf = F_val.shape
-
-    # ===== INFERENCE =====
-    raw_maps, img_scores, gt_list_out = [], [], []
+    # immagini GOOD train
+    train_imgs: List[np.ndarray] = []
     with torch.inference_mode():
-        total_imgs, idx_feat = F_val.shape[0], 0
-        pbar = tqdm(total=total_imgs, desc="InReaCh inference", leave=False)
+        for xb, yb, mb in tqdm(train_loader, desc="| collect train imgs |"):
+            sel = (yb == 0)
+            if sel.any():
+                train_imgs.extend(_tensor_batch_to_uint8_images(xb[sel]))
 
-        for (x, y, _) in val_loader:
-            Bsz = y.shape[0]
-            f_batch = F_val[idx_feat:idx_feat+Bsz]; idx_feat += Bsz
-            for b in range(Bsz):
-                gt_list_out.append(int(y[b].item()))
-                f = f_batch[b]  # (C,Hf,Wf)
+    if len(train_imgs) == 0:
+        raise RuntimeError("Nessuna immagine GOOD per il train. Controlla TRAIN_POSITIONS/GOOD_FRACTION.")
 
-                if USE_FAISS and _FAISS_OK:
-                    dist_map = score_image_nn_faiss(f, bank_cpu, tile_q=TILE_Q)
-                else:
-                    dist_map = score_image_nn_torch(f, bank_cpu, tile_q=4096, tile_b=TILE_B, device=device)
+    # backbone e nodi (allineati alla repo; livelli da blocchi 1-4)
+    return_nodes = {
+        'layer1.0.relu_2': 'L1',
+        'layer1.1.relu_2': 'L2',
+        'layer1.2.relu_2': 'L3',
+        'layer2.0.relu_2': 'L4',
+        'layer2.1.relu_2': 'L5',
+        'layer2.2.relu_2': 'L6',
+        'layer2.3.relu_2': 'L7',
+        'layer3.1.relu_2': 'L8',
+        'layer3.2.relu_2': 'L9',
+        'layer3.3.relu_2': 'L10',
+        'layer3.4.relu_2': 'L11',
+        'layer3.5.relu_2': 'L12',
+        'layer4.0.relu_2': 'L13',
+    }
+    model = load_wide_resnet_50(return_nodes=return_nodes)
 
-                M = dist_map.unsqueeze(0).unsqueeze(0)
-                mup = F.interpolate(M, size=IMG_SIZE, mode='bilinear', align_corners=False).squeeze().cpu().numpy()
-                mup = gaussian_filter(mup, sigma=GAUSS_SIGMA).astype(np.float32)
-                raw_maps.append(mup); img_scores.append(float(mup.max()))
-                pbar.update(1)
+    # InReaCh (repo-faithful)
+    inreach = InReaCh(
+        images=train_imgs,
+        model=model,
+        return_nodes_keys_in_order=list(return_nodes.values()),  # <<-- OUTPUT-keys (FIX)
+        assoc_depth=ASSOC_DEPTH,
+        min_channel_length=MIN_CHANNEL_LENGTH,
+        max_channel_std=MAX_CHANNEL_STD,
+        filter_size=FILTER_SIZE,
+        use_positional_embeddings=True,
+        pos_embed_dim=64
+    )
 
-        pbar.close()
+    # Val set -> liste
+    val_imgs: List[np.ndarray] = []
+    val_masks: List[np.ndarray] = []
+    val_labels: List[int] = []
+    with torch.inference_mode():
+        for xb, yb, mb in tqdm(val_loader, desc="| collect val imgs |"):
+            val_imgs.extend(_tensor_batch_to_uint8_images(xb))
+            val_masks.extend(_tensor_batch_to_uint8_masks(mb))
+            val_labels.extend(yb.detach().cpu().numpy().tolist())
 
-    img_scores = np.array(img_scores, dtype=np.float32)
-    gt_np = np.asarray(gt_list_out, dtype=np.int32)
+    # inferenza
+    score_maps = inreach.predict(val_imgs)
 
-    # ----- image-level AUROC -----
-    fpr, tpr, thr = roc_curve(gt_np, img_scores)
-    auc_img = roc_auc_score(gt_np, img_scores)
+    # image-level score: max
+    img_scores = np.asarray([float(np.max(s)) for s in score_maps], dtype=np.float32)
+    y_true    = np.asarray(val_labels, dtype=np.int32)
+
+    fpr, tpr, thr = roc_curve(y_true, img_scores)
+    auc_img = roc_auc_score(y_true, img_scores)
+    print(f"[image-level] ROC-AUC ({CODICE_PEZZO}/train={TRAIN_TAG}): {auc_img:.3f}")
+
     J = tpr - fpr
-    best_idx = int(np.argmax(J)); best_thr = float(thr[best_idx])
+    best_idx = int(np.argmax(J))
+    best_thr = float(thr[best_idx])
     preds = (img_scores >= best_thr).astype(np.int32)
-    tn, fp, fn, tp = confusion_matrix(gt_np, preds, labels=[0,1]).ravel()
-    _p(f"[image-level] AUC={auc_img:.3f}  thr(Youden)={best_thr:.6f}  TN:{tn} FP:{fp} FN:{fn} TP:{tp}")
+    tn, fp, fn, tp = confusion_matrix(y_true, preds, labels=[0,1]).ravel()
+    print(f"[image-level] soglia (Youden) = {best_thr:.6f}")
+    print(f"[image-level] CM -> TN:{tn}  FP:{fp}  FN:{fn}  TP:{tp}")
+    print(f"[image-level] TPR:{tpr[best_idx]:.3f}  FPR:{fpr[best_idx]:.3f}")
 
-    # ----- pixel-level -----
+    if VIS_PREDICTION_ON_VALID_DATASET:
+        show_validation_grid_from_loader(
+            val_loader, img_scores, preds,
+            per_page=4, samples_per_row=2,
+            show_mask=True, show_mask_product=True,
+            overlay=True, overlay_alpha=0.45
+        )
+
+    # pixel-level (heatmap RAW)
     results = run_pixel_level_evaluation(
-        score_map_list=raw_maps,
+        score_map_list=score_maps,
         val_set=val_set,
-        img_scores=img_scores,
+        img_scores=img_scores.tolist(),
         use_threshold="pro",
         fpr_limit=0.01,
         vis=True,
