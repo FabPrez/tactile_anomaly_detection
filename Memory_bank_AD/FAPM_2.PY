@@ -31,7 +31,7 @@ METHOD               = "FAPM"     # nome metodo per salvataggio pickle (cartelle
 CODICE_PEZZO         = "PZ3"
 
 TRAIN_POSITIONS      = ["pos2"]
-VAL_GOOD_PER_POS     = 20
+VAL_GOOD_PER_POS     = 0
 VAL_GOOD_SCOPE       = ["pos2"]
 VAL_FAULT_SCOPE      = ["pos2"]
 GOOD_FRACTION        = 1.0
@@ -454,7 +454,9 @@ def main():
     print(f"Val  FAULT (pos {meta['val_fault_positions']}): {meta['counts']['val_fault']}")
     print(f"Val  TOT: {meta['counts']['val_total']}")
 
-    train_loader, val_loader = make_loaders(train_set, val_set, batch_size=max( BATCH_TEST), device=device)
+    # === Unica modifica richiesta: batch di validazione = 1 (repo-faithful) ===
+    train_loader, _ = make_loaders(train_set, val_set, batch_size=max(8, BATCH_TEST), device=device)
+    _, val_loader   = make_loaders(train_set, val_set, batch_size=1,                   device=device)
 
     # Backbone
     model = STPM(device=device).to(device).eval()
