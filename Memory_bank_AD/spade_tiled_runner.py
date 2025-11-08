@@ -1,7 +1,6 @@
 # spade_tiled_runner.py
-# SPADE "divide & conquer" sequenziale su N tile per immagine (solo full-res).
-# Griglia a CONTEGGIO FISSO (es. 2x3 -> 6 tile).
-# NON salva file per-tile; ricompone full-res e calcola anche image-level aggregato.
+# SPADE "divide & conquer" sequenziale su tile 224x224 (sliding grid, overlap opzionale).
+# Ricomposizione full-res con cosine window + image-level aggregato (mean/max).
 
 import os, gc
 from contextlib import nullcontext
@@ -30,13 +29,12 @@ VAL_FAULT_SCOPE = ["pos1"]
 GOOD_FRACTION = 1.0
 SEED = 42
 
-# Backbone input size
+# Backbone input size (fisso a 224 per ResNet)
 BACKBONE_IMG_SIZE = 224
 
-# --- Griglia: CONTEGGIO FISSO ---
-FIXED_ROWS = 2           # es.: 2 righe
-FIXED_COLS = 3           # es.: 2 colonne  -> 4 tile
+# --- Griglia: MISURA FISSA 224x224 (sliding grid) ---
 FIXED_OVERLAP = 0        # overlap opzionale (0, 16, 32, ...)
+# Nota: stride = 224 - FIXED_OVERLAP; copertura totale con clamp ai bordi.
 
 # Visual/valutazione
 GAUSSIAN_SIGMA = 4
@@ -53,27 +51,38 @@ IMG_SCORE_AGG = "mean"
 # ------------------------------------------
 
 
-# ---------- utils griglia (conteggio fisso) ----------
-def compute_tile_grid_by_counts(H: int, W: int, n_rows: int, n_cols: int, overlap: int = 0):
+# ---------- utils griglia (MISURA FISSA 224x224) ----------
+def compute_tile_grid_by_size(H: int, W: int, tile_h: int = 224, tile_w: int = 224,
+                              overlap: int = 0) -> List[Tuple[int,int,int,int]]:
     """
-    Divide l'immagine in n_rows × n_cols rettangoli contigui (copertura completa),
-    con possibilità di un piccolo overlap interno. Ritorna lista di tuple (y,x,h,w).
+    Griglia sliding a misura fissa:
+    - tile_h/tile_w ~ 224
+    - overlap in pixel (0,16,32,...)
+    Copre tutta l'immagine (gli ultimi step sono clampati ai bordi).
+    Ritorna lista di (y,x,h,w).
     """
-    ys = np.linspace(0, H, n_rows + 1, dtype=int)
-    xs = np.linspace(0, W, n_cols + 1, dtype=int)
-    rects = []
-    for r in range(n_rows):
-        for c in range(n_cols):
-            y0, y1 = ys[r], ys[r + 1]
-            x0, x1 = xs[c], xs[c + 1]
-            if overlap > 0:
-                if r > 0:        y0 = max(0, y0 - overlap // 2)
-                if r < n_rows-1: y1 = min(H, y1 + overlap // 2)
-                if c > 0:        x0 = max(0, x0 - overlap // 2)
-                if c < n_cols-1: x1 = min(W, x1 + overlap // 2)
-            h = max(1, y1 - y0)
-            w = max(1, x1 - x0)
-            rects.append((int(y0), int(x0), int(h), int(w)))
+    assert tile_h > 0 and tile_w > 0
+    stride_h = max(1, tile_h - overlap)
+    stride_w = max(1, tile_w - overlap)
+
+    rects: List[Tuple[int,int,int,int]] = []
+    y = 0
+    while True:
+        x = 0
+        h = min(tile_h, H - y)
+        while True:
+            w = min(tile_w, W - x)
+            rects.append((int(y), int(x), int(h), int(w)))
+            if x + tile_w >= W:
+                break
+            x += stride_w
+            if x + tile_w > W:
+                x = max(0, W - tile_w)
+        if y + tile_h >= H:
+            break
+        y += stride_h
+        if y + tile_h > H:
+            y = max(0, H - tile_h)
     return rects
 
 
@@ -172,21 +181,33 @@ def run_spade_for_tile(train_loader: DataLoader,
 
     # ---- TRAIN feature ----
     for x, y, m, _ in tqdm(train_loader, desc='[tile] feature | train'):
+        # Sanity: ogni batch deve essere (B,3,224,224)
+        assert x.dim() == 4 and x.shape[-1] == BACKBONE_IMG_SIZE and x.shape[-2] == BACKBONE_IMG_SIZE, \
+            "Tile non 224x224 in TRAIN: got {}".format(tuple(x.shape))
         x = x.to(device, non_blocking=True)
-        with torch.no_grad(): _ = model(x)
-        for k, v in zip(tr_feats.keys(), outputs): tr_feats[k].append(v.detach().cpu())
+        with torch.no_grad():
+            _ = model(x)
+        for k, v in zip(tr_feats.keys(), outputs):
+            tr_feats[k].append(v.detach().cpu())
         outputs.clear()
-    for k in tr_feats: tr_feats[k] = torch.cat(tr_feats[k], 0)
+    for k in tr_feats:
+        tr_feats[k] = torch.cat(tr_feats[k], 0)
 
     # ---- VAL feature ----
     for x, y, m, idx in tqdm(val_loader, desc='[tile] feature | val'):
+        # Sanity
+        assert x.dim() == 4 and x.shape[-1] == BACKBONE_IMG_SIZE and x.shape[-2] == BACKBONE_IMG_SIZE, \
+            "Tile non 224x224 in VAL: got {}".format(tuple(x.shape))
         gt_list.extend(y.numpy().tolist() if isinstance(y, torch.Tensor) else list(y))
         order_val_idx.extend(idx.numpy().tolist() if isinstance(idx, torch.Tensor) else [int(idx)])
         x = x.to(device, non_blocking=True)
-        with torch.no_grad(): _ = model(x)
-        for k, v in zip(te_feats.keys(), outputs): te_feats[k].append(v.detach().cpu())
+        with torch.no_grad():
+            _ = model(x)
+        for k, v in zip(te_feats.keys(), outputs):
+            te_feats[k].append(v.detach().cpu())
         outputs.clear()
-    for k in te_feats: te_feats[k] = torch.cat(te_feats[k], 0)
+    for k in te_feats:
+        te_feats[k] = torch.cat(te_feats[k], 0)
 
     gt_np = np.asarray(gt_list, dtype=np.int32)
 
@@ -225,7 +246,7 @@ def run_spade_for_tile(train_loader: DataLoader,
 
         score_map = torch.mean(torch.cat(per_layer, 0), 0).squeeze().numpy().astype(np.float32)
         if gaussian_sigma > 0:
-            score_map = gaussian_filter(score_map, sigma=gaussian_sigma)  # usa il parametro locale
+            score_map = gaussian_filter(score_map, sigma=gaussian_sigma)
         score_map_list.append(score_map)
 
     # free
@@ -302,10 +323,13 @@ def main():
     else:
         raise RuntimeError("AUTO_SIZE_FROM_DATA=False non gestito qui")
 
-    # Costruzione griglia
-    grid = compute_tile_grid_by_counts(TGT_H, TGT_W, FIXED_ROWS, FIXED_COLS, overlap=FIXED_OVERLAP)
+    # Griglia a misura fissa 224x224 (sliding)
+    grid = compute_tile_grid_by_size(TGT_H, TGT_W, tile_h=BACKBONE_IMG_SIZE, tile_w=BACKBONE_IMG_SIZE,
+                                     overlap=FIXED_OVERLAP)
     N_tiles = len(grid)
-    print(f"[grid] {N_tiles} tile -> {grid[:3]}...")
+    print("[grid] {} tile fissi 224x224, overlap={} -> esempio primi 3: {}".format(
+        N_tiles, FIXED_OVERLAP, grid[:3]
+    ))
 
     tile_to_rect: Dict[int, Tuple[int,int,int,int]] = {i: r for i, r in enumerate(grid)}
     tile_val_heatmaps: Dict[int, Dict[int, np.ndarray]] = {i: {} for i in range(N_tiles)}
@@ -315,7 +339,7 @@ def main():
 
     # ====== Loop sequenziale sui tile ======
     for t_id, rect in enumerate(grid):
-        print(f"\n=== TILE {t_id+1}/{N_tiles} rect={rect} ===")
+        print("\n=== TILE {}/{} rect={} ===".format(t_id+1, N_tiles, rect))
 
         train_tile_ds = TileViewDataset(train_set, rect, out_size=BACKBONE_IMG_SIZE)
         val_tile_ds   = TileViewDataset(val_set,   rect, out_size=BACKBONE_IMG_SIZE)
@@ -344,7 +368,8 @@ def main():
         # cleanup
         del train_loader, val_loader, train_tile_ds, val_tile_ds, out, score_map_list, order_val_idx, img_scores_tile
         gc.collect()
-        if device.type == "cuda": torch.cuda.empty_cache()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
     # ====== RICOMPOSIZIONE & IMAGE-LEVEL AGGREGATO ======
     if DO_RECOMPOSE:
@@ -382,15 +407,17 @@ def main():
             vis=True,
             vis_ds_or_loader=val_set
         )
-        print_pixel_report(results, title=f"{METHOD}-TILED | {CODICE_PEZZO}  tiles={N_tiles}  agg={IMG_SCORE_AGG}")
+        print_pixel_report(results, title="{}-TILED | {}  tiles={}  agg={}".format(
+            METHOD, CODICE_PEZZO, N_tiles, IMG_SCORE_AGG
+        ))
 
         if SAVE_FINAL_FULLRES:
-            np.savez_compressed(os.path.join(SAVE_DIR, f"{CODICE_PEZZO}_fullres_val_heatmaps.npz"),
+            np.savez_compressed(os.path.join(SAVE_DIR, "{}_fullres_val_heatmaps.npz".format(CODICE_PEZZO)),
                                 **{str(i): m for i, m in enumerate(full_res_maps)})
             print("[save] full-res heatmaps salvate (pacchetto unico).")
 
     print("\n[done] Sequenza tiled completata.")
-    
+
 
 if __name__ == "__main__":
     main()
