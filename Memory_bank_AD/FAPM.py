@@ -16,6 +16,10 @@ from tqdm import tqdm
 
 from torchvision.models import wide_resnet50_2, Wide_ResNet50_2_Weights
 
+# NEW: per valutazione image-level
+import matplotlib.pyplot as plt
+from sklearn.metrics import roc_curve, roc_auc_score, confusion_matrix
+
 # ==== tue utility (stesso naming che usi altrove) ====
 from data_loader import build_ad_datasets, make_loaders, save_split_pickle, load_split_pickle
 from ad_analysis import run_pixel_level_evaluation, print_pixel_report
@@ -28,13 +32,13 @@ except Exception:
 
 # ---------------- CONFIG ----------------
 METHOD               = "FAPM"     # nome metodo per salvataggio pickle (cartelle tue utility)
-CODICE_PEZZO         = "PZ5"
+CODICE_PEZZO         = "PZ4"
 
 TRAIN_POSITIONS      = ["pos1"]
 VAL_GOOD_PER_POS     = 20
 VAL_GOOD_SCOPE       = ["pos1"]
 VAL_FAULT_SCOPE      = ["pos1"]
-GOOD_FRACTION        = 1.0  #0.2 #0.3 #0.5 #0.7  #1.0
+GOOD_FRACTION        = 0.7  #0.2 #0.3 #0.5 #0.7  #1.0
 
 IMG_SIZE             = 224
 SEED                 = 42
@@ -497,7 +501,41 @@ def main():
     # Validazione
     out = run_validation(device, model, val_loader, mem_payload)
 
-    # Valutazione pixel-level con le tue utility
+    # ================= IMAGE-LEVEL  =================
+    img_scores = out["img_scores"]                 # (N_img,)
+    gt_img     = out["gt_img"].astype(np.int32)    # 0=good, 1=fault
+
+    # ROC, AUC
+    fpr, tpr, thresholds = roc_curve(gt_img, img_scores)
+    auc_img = roc_auc_score(gt_img, img_scores)
+    print(f"[image-level] ROC-AUC ({CODICE_PEZZO}/train={TRAIN_TAG}): {auc_img:.3f}")
+
+    # Soglia di Youden
+    J = tpr - fpr
+    best_idx = int(np.argmax(J))
+    best_thr = float(thresholds[best_idx])
+
+    preds = (img_scores >= best_thr).astype(np.int32)
+    tn, fp, fn, tp = confusion_matrix(gt_img, preds, labels=[0, 1]).ravel()
+    print(f"[image-level] soglia (Youden) = {best_thr:.6f}")
+    print(f"[image-level] CM -> TN:{tn}  FP:{fp}  FN:{fn}  TP:{tp}")
+    print(f"[image-level] TPR:{tpr[best_idx]:.3f}  FPR:{fpr[best_idx]:.3f}")
+
+    # Curva ROC 
+    fig, ax = plt.subplots(1, 2, figsize=(10, 4))
+    ax[0].plot(fpr, tpr, label=f"AUC={auc_img:.3f}")
+    ax[0].plot([0, 1], [0, 1], 'k--', linewidth=1)
+    ax[0].set_title("Image-level ROC")
+    ax[0].set_xlabel("FPR")
+    ax[0].set_ylabel("TPR")
+    ax[0].legend()
+    plt.tight_layout()
+    plt.show()
+
+    print(f"[check] len(val_loader.dataset) = {len(val_loader.dataset)}")
+    print(f"[check] len(img_scores)         = {len(img_scores)}")
+
+    # ================ PIXEL-LEVEL  ================
     results = run_pixel_level_evaluation(
         score_map_list=list(out["raw_score_maps"]),
         val_set=val_set,
