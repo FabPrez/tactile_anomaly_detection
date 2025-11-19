@@ -54,7 +54,7 @@ FILTER_SIZE        = 13
 KNN_K = 1
 
 # Positional embedding gate (stile repo)
-POS_EMBED_THRESH_DEFAULT = 1000.0   
+POS_EMBED_THRESH_DEFAULT = 1000.0
 POS_EMBED_WEIGHT_ON      = 5.0     # fattore di scala dei due canali (y,x) quando gate=ON
 
 # Visual
@@ -207,7 +207,7 @@ class MeanMapper(torch.nn.Module):
 class PatchMakerFD:
     def __init__(self, patchsize, stride=None):
         self.patchsize = patchsize
-        self.stride = stride if self.stride is not None else 1 if stride is None else stride
+        self.stride = 1 if stride is None else stride
 
     def patchify(self, features, return_spatial_info=False):
         padding = int((self.patchsize - 1) / 2)
@@ -244,7 +244,7 @@ class Feautre_Descriptor(abc.ABC):
     """
     def __init__(self,
                  model : torch.nn.Module,
-                 image_size: tuple = (224,224,3), 
+                 image_size: tuple = (224,224,3),
                  flatten_output: bool = True,
                  positional_embeddings: float = 5.0,
                  pretrain_embed_dimension: int = 1024,
@@ -258,14 +258,18 @@ class Feautre_Descriptor(abc.ABC):
         self.target_embed_dimension = target_embed_dimension
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        test_image = torch.from_numpy(np.transpose(np.zeros(shape=(1, *image_size), dtype=np.float32), axes=[0, 3, 1, 2])).to(device)
+        test_image = torch.from_numpy(
+            np.transpose(np.zeros(shape=(1, *image_size), dtype=np.float32), axes=[0, 3, 1, 2])
+        ).to(device)
         with torch.no_grad():
             features = self.model(test_image)
         self.feature_size = [(features[layer].size(2), features[layer].size(3)) for layer in features.keys()]
 
         self.patch_maker = PatchMakerFD(patchsize=agg_size, stride=agg_stride)
-        self.agg_preprocessing = Preprocessing([features[layer].size(1) for layer in features.keys()],
-                                               self.pretrain_embed_dimension)
+        self.agg_preprocessing = Preprocessing(
+            [features[layer].size(1) for layer in features.keys()],
+            self.pretrain_embed_dimension
+        )
         self.pre_adapt_aggregator = Aggregator(target_dim=self.target_embed_dimension)
 
     def image_net_norm(self, image: np.ndarray) -> torch.Tensor:
@@ -284,7 +288,9 @@ class Feautre_Descriptor(abc.ABC):
         device = next(self.model.parameters()).device
         with torch.no_grad():
             output = []
-            for _, image in enumerate(tqdm(images, ncols=100, desc='Gen Feature Descriptors', disable=quite)):
+            for _, image in enumerate(tqdm(images, ncols=100,
+                                           desc='Gen Feature Descriptors',
+                                           disable=quite)):
                 x = self.image_net_norm(image).to(device)
                 feats_dict = self.model(x)
                 features_list = [feats_dict[layer] for layer in feats_dict.keys()]  # in ordine
@@ -316,7 +322,7 @@ class Feautre_Descriptor(abc.ABC):
                         *perm_base_shape[:-2], ref_num_patches[0], ref_num_patches[1]
                     )  # [B, C, ps, ps, Href, Wref]
                     _features = _features.permute(0, -2, -1, 1, 2, 3)  # [B, Href, Wref, C, ps, ps]
-                    _features = _features.reshape(len(_features), -1, *_features.shape[-3:])  # [B, Lref, C, ps, ps]
+                    _features = _features.reshape(len(_features), -1, *_features.shape[-3:])
                     features_pw[i] = _features
 
                 # appiattisci per layer a (B*Lref, C, ps, ps)
@@ -326,7 +332,10 @@ class Feautre_Descriptor(abc.ABC):
                 mapped = self.agg_preprocessing(features_pw)  # [B*Lref per layer -> aggregato per layer]
                 pooled = self.pre_adapt_aggregator(mapped)    # [B*Lref, target_dim]
                 # Rimetti a [Href, Wref, D]
-                pooled = torch.reshape(pooled, (*self.feature_size[0], self.target_embed_dimension))  # (Href, Wref, D)
+                pooled = torch.reshape(
+                    pooled,
+                    (*self.feature_size[0], self.target_embed_dimension)
+                )  # (Href, Wref, D)
                 output.append(pooled.unsqueeze(0).cpu())  # Store su CPU per risparmiare GPU
 
                 del feats_dict, features_list, features_pw, mapped, pooled, x
@@ -341,12 +350,12 @@ class Feautre_Descriptor(abc.ABC):
             if self.positional_embeddings > 0:
                 with torch.no_grad():
                     # canale Y: rampa verticale normalizzata e scalata
-                    pos_y_vals = torch.arange(0, shape[2]).unsqueeze(0).unsqueeze(0).unsqueeze(3)  # [1,1,H,1]
+                    pos_y_vals = torch.arange(0, shape[2]).unsqueeze(0).unsqueeze(0).unsqueeze(3)
                     pos_y_vals = torch.mul(pos_y_vals, self.positional_embeddings / shape[2])
                     pos_y = pos_y_vals.repeat(shape[0], 1, 1, shape[3])  # [N,1,H,W]
 
                     # canale X: rampa orizzontale normalizzata e scalata
-                    pos_x_vals = torch.arange(0, shape[3]).unsqueeze(0).unsqueeze(0).unsqueeze(2)  # [1,1,1,W]
+                    pos_x_vals = torch.arange(0, shape[3]).unsqueeze(0).unsqueeze(0).unsqueeze(2)
                     pos_x_vals = torch.mul(pos_x_vals, self.positional_embeddings / shape[3])
                     pos_x = pos_x_vals.repeat(shape[0], 1, shape[2], 1)  # [N,1,H,W]
 
@@ -389,9 +398,15 @@ class InReaCh:
             images=self.images,
             threashold=pos_embed_thresh,
             masks=self.masks,
-            align=True,            # <— modificato: True
+            align=True,            # repo-like
             quite=self.quite
         )
+        # 🔧 Patch repo-faithful:
+        # se l'utente non ha passato maschere a __init__ (masks=None),
+        # ignoriamo eventuali liste di None restituite dall'allineamento.
+        if masks is None:
+            self.masks = None
+
         self.pos_embed_weight = float(pos_embed_weight) if self.pos_embed_flag else 0.0
 
         # Feature Extraction (NO ImageNet normalize)
@@ -591,7 +606,8 @@ class InReaCh:
         t_patches = self.fd_gen.generate_descriptors(t_images, quite=quite)  # [N, D, L]
         
         scores = []
-        for test_img_index in tq.tqdm(range(t_patches.size(0)), ncols=100, desc='Predicting On Images', disable=quite):
+        for test_img_index in tq.tqdm(range(t_patches.size(0)), ncols=100,
+                                      desc='Predicting On Images', disable=quite):
             q = torch.permute(t_patches[test_img_index], (1, 0)).contiguous().cpu().numpy().astype(np.float32)  # (L, D)
             dist, ind = self.nn_object.search(q, KNN_K)
             dist = dist[:, 0]

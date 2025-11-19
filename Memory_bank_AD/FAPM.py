@@ -28,13 +28,13 @@ except Exception:
 
 # ---------------- CONFIG ----------------
 METHOD               = "FAPM"     # nome metodo per salvataggio pickle (cartelle tue utility)
-CODICE_PEZZO         = "PZ2"
+CODICE_PEZZO         = "PZ5"
 
-TRAIN_POSITIONS      = ["pos5"]
-VAL_GOOD_PER_POS     = 0
-VAL_GOOD_SCOPE       = ["pos5"]
-VAL_FAULT_SCOPE      = ["pos5"]
-GOOD_FRACTION        = 1.0
+TRAIN_POSITIONS      = ["pos1"]
+VAL_GOOD_PER_POS     = 20
+VAL_GOOD_SCOPE       = ["pos1"]
+VAL_FAULT_SCOPE      = ["pos1"]
+GOOD_FRACTION        = 1.0  #0.2 #0.3 #0.5 #0.7  #1.0
 
 IMG_SIZE             = 224
 SEED                 = 42
@@ -300,13 +300,23 @@ def _cdist_topk_mean(q: torch.Tensor, bank: torch.Tensor, k: int) -> torch.Tenso
     """
     q:    (P, C)           # sub-patch query, P=16 (fine) o 4 (coarse)
     bank: (P, M, C)        # banca per cella, M = m_near o m_far
-    return: (P, k)         # k NN per ciascun sub-patch
+    return: (P, k)         # sempre k NN (con padding se M < k)
     """
     # Trattiamo P come batch: cdist((P,1,C),(P,M,C)) -> (P,1,M) -> (P,M)
     D = torch.cdist(q.unsqueeze(1), bank)   # (P, 1, M)
     D = D.squeeze(1)                        # (P, M)
-    k = min(k, D.shape[1])
-    vals, _ = torch.topk(D, k=k, largest=False, dim=1)  # (P, k)
+    M = D.shape[1]
+
+    # k effettivo = quanti vettori ci sono davvero in memory
+    k_eff = min(k, M)
+    vals, _ = torch.topk(D, k=k_eff, largest=False, dim=1)  # (P, k_eff)
+
+    # Se ho meno di k vettori in memoria, replico l'ultimo vicino
+    # per avere comunque (P, k) ed evitare mismatch di shape.
+    if k_eff < k:
+        last = vals[:, -1:].expand(-1, k - k_eff)           # (P, k - k_eff)
+        vals = torch.cat([vals, last], dim=1)               # (P, k)
+
     return vals
 
 

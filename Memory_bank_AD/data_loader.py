@@ -93,17 +93,14 @@ def get_items(
     *,
     with_masks: bool = False,
     mask_return_type: Literal["path", "pil", "numpy"] = "numpy",
-    mask_binarize: bool = True,     # se True: numpy 0/1 (o PIL con 0/255)
-    mask_align: Literal["order", "name"] = "order",  # mantenuto per compatibilità (qui usiamo l'indice)
-    rgb_policy: Literal["prefer_320", "prefer_fullres", "fullres_only"] = "prefer_320",  # NEW
-) -> Union[
-    List[Union[Path, Image.Image, np.ndarray]],
-    tuple[List[Union[Path, Image.Image, np.ndarray]], List[Optional[Union[Path, Image.Image, np.ndarray]]]]
-]:
+    mask_binarize: bool = True,
+    mask_align: Literal["order", "name"] = "order",
+    rgb_policy: Literal["prefer_320", "prefer_fullres", "fullres_only"] = "prefer_320",
+):
     """
     Layout usato:
       - GOOD  -> immagini da: (policy) tra rgb_320x240 e rgb
-      - FAULT -> immagini da: (policy) tra fault/rgb_320x240 e fault/rgb (fallback anche a good/rgb in caso di dataset ibridi)
+      - FAULT -> immagini da: (policy) tra fault/rgb_320x240 e fault/rgb (fallback anche a good/rgb)
                  maschere da: (policy) tra fault/mask_320x240 e fault/mask
       - FAULT: abbinamento img–mask per indice (natural sort), fino a min(#img, #mask).
     """
@@ -262,9 +259,9 @@ def get_items(
                 m = m.point(lambda v: 255 if v > 0 else 0)
             masks_out.append(m)
         elif mask_return_type == "numpy":
-            m = np.array(_load_mask_pil(mp))  # (H,W), 0..255
+            m = np.array(_load_mask_pil(mp))
             if mask_binarize:
-                m = (m > 0).astype(np.uint8)   # 0/1
+                m = (m > 0).astype(np.uint8)
             masks_out.append(m)
         else:
             raise ValueError("mask_return_type non valido.")
@@ -329,12 +326,55 @@ def _ensure_list(x):
 def _positions_tag(pos_list):
     return "+".join(pos_list) if len(pos_list) > 0 else "all"
 
-def _train_tag_with_fraction(pos_list, good_fraction: float | None):
+# --- NEW: frazione per-posizione ---
+def _get_frac_for_pos(good_fraction, pos: str) -> float:
+    """
+    Restituisce la frazione da usare per una certa posizione.
+
+    - se good_fraction è float (o int): stessa frazione per tutte le posizioni
+    - se è dict: usa good_fraction[pos] se presente, altrimenti 1.0
+    - se è None: default 1.0
+    """
+    if isinstance(good_fraction, dict):
+        frac = float(good_fraction.get(pos, 1.0))
+    elif good_fraction is None:
+        frac = 1.0
+    else:
+        frac = float(good_fraction)
+    if frac < 0.0:
+        frac = 0.0
+    if frac > 1.0:
+        frac = 1.0
+    return frac
+
+def _train_tag_with_fraction(pos_list, good_fraction) -> str:
+    """
+    Crea un tag testuale che codifica le posizioni di train e (eventualmente)
+    le frazioni per-posizione, usato per nominare i pickle.
+
+    Esempi:
+      - good_fraction = 0.2, pos_list=["pos1","pos2"]
+          -> "pos1+pos2@p20"
+      - good_fraction = {"pos1":0.2, "pos2":0.05}
+          -> "pos1@p20+pos2@p05"
+    """
     base = _positions_tag(pos_list)
-    if good_fraction is None or good_fraction >= 0.999:
-        return base
-    pct = max(1, int(round(100 * float(good_fraction))))
-    return f"{base}@p{pct}"
+    if isinstance(good_fraction, dict):
+        parts = []
+        for p in pos_list:
+            frac = _get_frac_for_pos(good_fraction, p)
+            if frac >= 0.999:
+                parts.append(p)
+            else:
+                pct = max(1, int(round(100 * frac)))
+                parts.append(f"{p}@p{pct}")
+        return "+".join(parts) if parts else base
+    else:
+        if good_fraction is None or float(good_fraction) >= 0.999:
+            return base
+        frac = float(good_fraction)
+        pct = max(1, int(round(100 * frac)))
+        return f"{base}@p{pct}"
 
 def _resolve_val_fault_positions(all_pos, train_pos_list, scope):
     if isinstance(scope, (list, tuple, set)):
@@ -369,7 +409,7 @@ def _get_T():
 
 class MyDataset(Dataset):
     """
-    Dataset semplice per immagini RGB (lista PIL) con maschere opzionali (lista np.ndarray o PIL).
+    Dataset semplice per immagini RGB (lista PIL) con maschere opzionali.
     Normalizza in [0,1], applica la stessa transform geometrica a immagine e maschera.
     """
     def __init__(self, images, label_type: str, transform=None, masks=None):
@@ -386,8 +426,8 @@ class MyDataset(Dataset):
         for img_pil, mk in zip(images, masks):
             assert isinstance(img_pil, Image.Image), "Le immagini devono essere PIL.Image"
             img_pil_t = transform(img_pil) if transform is not None else img_pil
-            img_np = np.array(img_pil_t)             # (H,W,C) uint8
-            img_t = torch.tensor(img_np, dtype=torch.float32).permute(2, 0, 1) / 255.0  # (C,H,W)
+            img_np = np.array(img_pil_t)
+            img_t = torch.tensor(img_np, dtype=torch.float32).permute(2, 0, 1) / 255.0
 
             H, W = img_t.shape[1], img_t.shape[2]
 
@@ -410,10 +450,9 @@ class MyDataset(Dataset):
             masks_t.append(torch.from_numpy(mk_np))
 
         if len(imgs_t) == 0:
-            raise ValueError("Nessuna immagine nel dataset costruito (lista vuota). "
-                             "Controlla percorsi/cartelle e split.")
+            raise ValueError("Nessuna immagine nel dataset costruito (lista vuota).")
 
-        self.data   = torch.stack(imgs_t)                                # (N, C, H, W)
+        self.data   = torch.stack(imgs_t)
         self.labels = torch.full((len(self.data),), self.label_value, dtype=torch.long)
         self.masks  = torch.stack(masks_t)
 
@@ -430,40 +469,59 @@ def _cap_warn(pos, want, avail):
     return k
 
 def _k_map_for_positions(positions, val_good_per_pos):
+    """
+    Restituisce una mappa pos -> valore grezzo (float) che può essere:
+      - >= 1.0 : numero assoluto di immagini da spostare in validation
+      - 0 < v < 1.0 : frazione del numero di GOOD di quella posizione
+      - 0.0 : nessuna immagine per quella posizione
+    """
     if val_good_per_pos is None:
-        return {p: 0 for p in positions}
-    if isinstance(val_good_per_pos, int):
-        return {p: max(val_good_per_pos, 0) for p in positions}
+        return {p: 0.0 for p in positions}
+    if isinstance(val_good_per_pos, (int, float)):
+        v = float(val_good_per_pos)
+        return {p: max(v, 0.0) for p in positions}
     if isinstance(val_good_per_pos, dict):
-        return {p: max(int(val_good_per_pos.get(p, 0)), 0) for p in positions}
-    raise ValueError("val_good_per_pos deve essere int, dict o None")
+        out = {}
+        for p in positions:
+            v = float(val_good_per_pos.get(p, 0.0))
+            out[p] = max(v, 0.0)
+        return out
+    raise ValueError("val_good_per_pos deve essere int, float, dict o None")
 
 # ---------------- builder principale ----------------
 def build_ad_datasets(
     *,
     part: str,
-    img_size: Optional[Union[int, Tuple[int, int]]] = None,  # opzionale e può essere (H,W)
-    train_positions,            # str | list[str]
-    val_fault_scope,            # "train_only" | "all" | list[str]
-    val_good_scope,             # "from_train" | "all_positions" | "none" | list[str]
-    val_good_per_pos: int | dict | None,   # quante GOOD per pos da spostare in validation
-    good_fraction: float | None = 1.0,     # % delle GOOD rimanenti da usare per il TRAIN per posizione
+    img_size: Optional[Union[int, Tuple[int, int]]] = None,
+    train_positions,
+    val_fault_scope,
+    val_good_scope,
+    val_good_per_pos: int | float | dict | None,
+    good_fraction: float | dict | None = 1.0,
     seed: int = 42,
     transform=None,
-    rgb_policy: Literal["prefer_320", "prefer_fullres", "fullres_only"] = "prefer_320",  # NEW
+    rgb_policy: Literal["prefer_320", "prefer_fullres", "fullres_only"] = "prefer_320",
 ):
     """
     - Se img_size è None => nessuna trasformazione di crop/resize (full-res).
     - Se img_size è int => CenterCrop(img_size, img_size).
     - Se img_size è (H, W) => CenterCrop((H, W)).
     - Se transform è passato, viene rispettato e img_size viene ignorato.
-    - Seleziona per posizione k=VAL_GOOD_PER_POS immagini GOOD per la validation.
-    - Rimuove queste GOOD dal TRAIN, poi applica il sotto-campionamento per-posizione con good_fraction.
-    - Ritorna (train_set, val_set, meta).
+
+    - VAL_GOOD_PER_POS:
+        * int / float globale:
+             v >= 1   -> numero assoluto per ogni posizione nello scope
+             0 < v < 1 -> frazione dei GOOD per ogni posizione nello scope
+        * dict per-posizione:
+             valore <1  -> frazione
+             valore >=1 -> numero assoluto
+
+    - good_fraction:
+        * float globale: stessa percentuale per tutte le posizioni di train
+        * dict per-posizione: frazione distinta per ogni posizione
     """
     T = _get_T()
 
-    # --- gestione transform / center-crop pulita ---
     if transform is None:
         if img_size is None:
             transform = None
@@ -475,7 +533,6 @@ def build_ad_datasets(
             else:
                 raise ValueError(f"img_size deve essere int oppure (H, W); trovato: {img_size!r}")
             transform = T.CenterCrop(size_tuple)
-    # altrimenti: se transform è già fornita dal chiamante, non toccarla
 
     all_pos = list_positions(part)
     train_pos_list = _ensure_list(train_positions)
@@ -484,11 +541,11 @@ def build_ad_datasets(
     # pos candidate per VALIDATION good
     val_good_pos = _resolve_val_good_positions(all_pos, train_pos_list, val_good_scope)
     if str(val_good_scope).lower() == "none":
-        k_map = {p: 0 for p in val_good_pos}
+        k_map_raw = {p: 0.0 for p in val_good_pos}
     else:
-        k_map = _k_map_for_positions(val_good_pos, val_good_per_pos)
+        k_map_raw = _k_map_for_positions(val_good_pos, val_good_per_pos)
 
-    # FAULT validation (img & mask secondo policy)
+    # FAULT validation
     val_fault_pos = _resolve_val_fault_positions(all_pos, train_pos_list, val_fault_scope)
     fault_val_pil, fault_val_masks = get_items(
         part, "rgb", label="fault", positions=val_fault_pos, return_type="pil",
@@ -498,7 +555,6 @@ def build_ad_datasets(
 
     rng = torch.Generator().manual_seed(seed)
 
-    # manteniamo per posizione
     train_keep_by_pos: dict[str, list[Image.Image]] = {}
     val_sel_by_pos:   dict[str, list[Image.Image]] = {}
     per_pos_counts:   dict[str, dict] = {}
@@ -508,9 +564,17 @@ def build_ad_datasets(
         imgs_pos = get_items(part, "rgb", label="good", positions=[pos], return_type="pil",
                              rgb_policy=rgb_policy)
         n = len(imgs_pos)
-        k = int(k_map.get(pos, 0)) if pos in val_good_pos else 0
-        if k > 0:
+        raw = float(k_map_raw.get(pos, 0.0)) if pos in val_good_pos else 0.0
+        if raw <= 0.0:
+            k = 0
+        else:
+            if raw < 1.0:
+                k = int(round(raw * n))
+            else:
+                k = int(raw)
             k = _cap_warn(pos, k, n)
+
+        if k > 0:
             idx = torch.randperm(n, generator=rng).tolist()
             sel  = [imgs_pos[i] for i in idx[:k]]
             keep = [imgs_pos[i] for i in idx[k:]]
@@ -531,8 +595,15 @@ def build_ad_datasets(
         imgs_pos = get_items(part, "rgb", label="good", positions=[pos], return_type="pil",
                              rgb_policy=rgb_policy)
         n = len(imgs_pos)
-        k = int(k_map.get(pos, 0))
-        k = _cap_warn(pos, k, n) if k > 0 else 0
+        raw = float(k_map_raw.get(pos, 0.0))
+        if raw <= 0.0:
+            k = 0
+        else:
+            if raw < 1.0:
+                k = int(round(raw * n))
+            else:
+                k = int(raw)
+            k = _cap_warn(pos, k, n)
         if k > 0:
             idx = torch.randperm(n, generator=rng).tolist()
             sel = [imgs_pos[i] for i in idx[:k]]
@@ -543,16 +614,14 @@ def build_ad_datasets(
 
     # --- sotto-campionamento percentuale del TRAIN per posizione ---
     good_train_remaining: list[Image.Image] = []
-    if good_fraction is None:
-        good_fraction = 1.0
-    good_fraction = float(good_fraction)
 
     for pos, keep in train_keep_by_pos.items():
-        if good_fraction >= 0.999:
+        frac_pos = _get_frac_for_pos(good_fraction, pos)
+        if frac_pos >= 0.999:
             picked = keep
         else:
             n_keep = len(keep)
-            n_pick = max(0, int(round(n_keep * good_fraction)))
+            n_pick = max(0, int(round(n_keep * frac_pos)))
             if n_pick < n_keep:
                 idx = torch.randperm(n_keep, generator=rng).tolist()
                 picked = [keep[i] for i in idx[:n_pick]]
@@ -560,6 +629,10 @@ def build_ad_datasets(
                 picked = keep
         good_train_remaining.extend(picked)
         per_pos_counts[pos]["good_train_after_fraction"] = len(picked)
+
+    # per posizioni che stanno solo in val (nessun train)
+    for pos in extra_val_pos:
+        per_pos_counts[pos].setdefault("good_train_after_fraction", 0)
 
     # good validation globali
     good_val_selected: list[Image.Image] = []
@@ -575,14 +648,18 @@ def build_ad_datasets(
     else:
         val_set = fault_val_ds
 
+    # mappa effettiva dei good spostati in validation per pos
+    val_good_counts = {pos: len(sel) for pos, sel in val_sel_by_pos.items()}
+
     meta = {
         "train_tag": train_tag,
-        "good_fraction": good_fraction,
+        "good_fraction": good_fraction,              # può essere float o dict
         "train_positions": train_pos_list,
         "val_fault_positions": val_fault_pos,
         "val_good_scope": val_good_scope,
         "val_good_positions": val_good_pos,
-        "val_good_per_pos": k_map,
+        "val_good_requested": k_map_raw,            # valori grezzi (float, frazione o count)
+        "val_good_per_pos": val_good_counts,        # valori effettivi (count per pos)
         "counts": {
             "train_good": len(good_train_ds),
             "val_good": len(good_val_selected),

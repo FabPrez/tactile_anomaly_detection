@@ -1,3 +1,4 @@
+# SPADE.py
 import torch, sys, platform
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
@@ -17,7 +18,10 @@ from scipy.ndimage import gaussian_filter
 import math
 
 from torchvision.models import wide_resnet50_2, Wide_ResNet50_2_Weights
-from sklearn.metrics import roc_curve, accuracy_score, confusion_matrix, roc_auc_score, precision_recall_curve, precision_score, recall_score, f1_score
+from sklearn.metrics import (
+    roc_curve, accuracy_score, confusion_matrix, roc_auc_score,
+    precision_recall_curve, precision_score, recall_score, f1_score
+)
 
 # >>> NEW: per componenti connesse nelle GT
 from scipy.ndimage import label as cc_label
@@ -27,37 +31,41 @@ from data_loader import save_split_pickle, load_split_pickle, build_ad_datasets,
 from view_utils import show_dataset_images, show_validation_grid_from_loader, show_heatmaps_from_loader
 from ad_analysis import run_pixel_level_evaluation, print_pixel_report
 
-#! TODO: configuration for training set that is in % of the amout -> voglio prendere solo il 10% delle immagini ad esempio e non tutte, posso farlo?
-
 # ----------------- CONFIG -----------------
 METHOD = "SPADE"
-CODICE_PEZZO = "PZ4"
+CODICE_PEZZO = "PZ3"
 
 # Posizioni "good" usate per il TRAIN (feature bank).
-# Puoi passare una stringa ("pos1") oppure una lista (["pos1","pos2"]).
 TRAIN_POSITIONS = ["pos1"]
 
 # Quanti GOOD per posizione spostare nella VALIDATION (e quindi togliere dal TRAIN).
 # Può essere:
-#   - int (stesso valore per tutte le pos del VAL_GOOD_SCOPE)
-#   - dict per-posizione, es: {"pos1": 10, "pos2": 30}
-VAL_GOOD_PER_POS = 0
-# Esempio alternativo:
-# VAL_GOOD_PER_POS = {"pos1": 10, "pos2": 30}
+#   - int  -> numero assoluto per ogni pos nello scope
+#   - float fra 0 e 1 -> percentuale dei GOOD di quella pos
+#   - dict, es: {"pos1": 10, "pos2": 0.2} (10 img per pos1, 20% per pos2)
+VAL_GOOD_PER_POS = 20
 
 # Da quali posizioni prelevare i GOOD per la VALIDATION:
 #   "from_train"     -> solo dalle pos di TRAIN_POSITIONS
-#   "all_positions"  -> da tutte le pos disponibili
+#   "all_positions"  -> da tutte le pos del pezzo
 #   ["pos1","pos3"]  -> lista custom
-VAL_GOOD_SCOPE = ["pos1"]
+VAL_GOOD_SCOPE = ["pos1", "pos2"]
 
 # Da quali posizioni prendere le FAULT per la VALIDATION:
 #   "train_only" | "all" | lista custom (es. ["pos1","pos2"])
-VAL_FAULT_SCOPE = ["pos1"]
+VAL_FAULT_SCOPE = ["pos1", "pos2"]
 
 # Percentuale di GOOD (rimasti dopo aver tolto quelli per la val) da usare nel TRAIN.
-# 1.0 = 100%, 0.1 = 10%, ecc. Questa percentuale entra nel tag dei pickle come "@pXX".
-GOOD_FRACTION = 1.0
+# Può essere:
+#   - float globale, es. 0.2  → 20% per tutte le pos di train
+#   - dict per-posizione, es:
+#       GOOD_FRACTION = {"pos1": 0.2, "pos2": 0.05}
+#     (20% dei good di pos1, 5% dei good di pos2 dopo la rimozione per la val;
+#      le pos non presenti nel dict usano 1.0 di default).
+GOOD_FRACTION = {
+    "pos1": 0.2,   # 20% pos1
+    "pos2": 0.05,  # 5% pos2
+}
 
 # Modello / dati
 TOP_K    = 5
@@ -71,7 +79,6 @@ GAUSSIAN_SIGMA = 4
 # ------------------------------------------
 
 
-
 # ---------- util ----------
 def calc_dist_matrix(x, y):
     """Euclidean distance matrix tra righe di x (n,d) e y (m,d) -> (n,m)."""
@@ -83,9 +90,11 @@ def calc_dist_matrix(x, y):
     dist_matrix = torch.sqrt(torch.pow(x - y, 2).sum(2))
     return dist_matrix
 
+
 def l2norm(x, dim=1, eps=1e-6):
     """Normalizzazione L2 lungo la dimensione 'dim' (cosine-like distance)."""
     return x / (x.norm(dim=dim, keepdim=True) + eps)
+
 
 @torch.no_grad()
 def topk_cdist_streaming(X, Y, k=7, block_x=1024, block_y=4096, device=torch.device('cuda'), use_amp=True):
@@ -93,7 +102,6 @@ def topk_cdist_streaming(X, Y, k=7, block_x=1024, block_y=4096, device=torch.dev
     X: (N_test, D)  Y: (N_train, D)
     Restituisce: topk_values (N_test,k), topk_indexes (N_test,k)
     """
-    # porta i tensori sul device richiesto
     X = X.to(device, non_blocking=True)
     Y = Y.to(device, non_blocking=True)
 
@@ -104,7 +112,6 @@ def topk_cdist_streaming(X, Y, k=7, block_x=1024, block_y=4096, device=torch.dev
         xi = X[i:i+block_x]  # (bx, D)
         vals_row, inds_row = None, None
 
-        # AMP solo se siamo su CUDA
         if use_amp and is_cuda:
             amp_ctx = torch.cuda.amp.autocast(dtype=torch.float16)
         else:
@@ -113,7 +120,7 @@ def topk_cdist_streaming(X, Y, k=7, block_x=1024, block_y=4096, device=torch.dev
         with amp_ctx:
             for j in range(0, Y.size(0), block_y):
                 yj = Y[j:j+block_y]              # (by, D)
-                d = torch.cdist(xi, yj)          # (bx, by) distanze L2
+                d = torch.cdist(xi, yj)          # (bx, by)
 
                 v, idx = torch.topk(d, k=min(k, d.size(1)), dim=1, largest=False)
                 idx = idx + j                    # shift indici locali -> globali
@@ -134,7 +141,6 @@ def topk_cdist_streaming(X, Y, k=7, block_x=1024, block_y=4096, device=torch.dev
     return topk_values, topk_indexes
 
 
-
 def main():
     # device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -147,12 +153,12 @@ def main():
         train_positions=TRAIN_POSITIONS,
         val_fault_scope=VAL_FAULT_SCOPE,
         val_good_scope=VAL_GOOD_SCOPE,
-        val_good_per_pos=VAL_GOOD_PER_POS,   # NEW
-        good_fraction=GOOD_FRACTION,         # NEW
+        val_good_per_pos=VAL_GOOD_PER_POS,   # ora può essere int/float/dict
+        good_fraction=GOOD_FRACTION,         # ora può essere float o dict per-posizione
         seed=SEED,
-        transform=None,  # oppure una tua pipeline T.Compose(...)
+        transform=None,
     )
-    TRAIN_TAG = meta["train_tag"] 
+    TRAIN_TAG = meta["train_tag"]
     print("[meta]", meta)
 
     if VIS_VALID_DATASET:
@@ -164,7 +170,6 @@ def main():
     print(f"Val  TOT: {meta['counts']['val_total']}")
 
     train_loader, val_loader = make_loaders(train_set, val_set, batch_size=32, device=device)
-
 
     # modello + hook
     weights = Wide_ResNet50_2_Weights.IMAGENET1K_V1
@@ -194,23 +199,13 @@ def main():
             with torch.no_grad():
                 _ = model(x)
             for k, v in zip(train_outputs.keys(), outputs):
-                train_outputs[k].append(v.detach().cpu())   # -> CPU per non saturare VRAM
+                train_outputs[k].append(v.detach().cpu())
             outputs = []
         for k in train_outputs:
             train_outputs[k] = torch.cat(train_outputs[k], dim=0)
         save_split_pickle(train_outputs, CODICE_PEZZO, TRAIN_TAG, split="train", method=METHOD)
-    
-    # ci aspettiamo una struttura così di train_outputs:
-    # {
-    #     'layer1': Tensor (N, C1, H1, W1),
-    #     'layer2': Tensor (N, C2, H2, W2),
-    #     'layer3': Tensor (N, C3, H3, W3),
-    #     'avgpool': Tensor (N, 2048, 1, 1),
-    # }
-    # dove N è il numero di immagini. Mentre AVGPOOL è l'ultimo strato della resnet in questione, questo va ad utilizzare 2048 numeri per descrivere l'intera feature map, mediando sui canali
 
-    # ====== VAL FEATURES (cache) ======
-    # ====== VALIDATION FEATURES (no cache) ======
+    # ====== VAL FEATURES ======
     gt_list = []
     for x, y, m in tqdm(val_loader, desc='| feature extraction | validation | custom |'):
         gt_list.extend(y.cpu().numpy())
@@ -223,68 +218,44 @@ def main():
     for k in test_outputs:
         test_outputs[k] = torch.cat(test_outputs[k], dim=0)
 
-    # --- controlli di allineamento ---
     gt_np = np.asarray(gt_list, dtype=np.int32)
     for k in test_outputs:
         assert test_outputs[k].shape[0] == len(gt_np), f"Mismatch batch su {k}"
 
-    # ====== IMAGE-LEVEL: KNN su avgpool ======
-    # dist_matrix = calc_dist_matrix(
-    #     torch.flatten(test_outputs['avgpool'], 1),    # (N_test, D)
-    #     torch.flatten(train_outputs['avgpool'], 1))   # (N_train, D)
-    
-    # # vado a calcolare la distanza euclidea considerenado un immagine fatta da 2048 numeri
-    # topk_values, topk_indexes = torch.topk(dist_matrix, k=TOP_K, dim=1, largest=False)
-    # img_scores = torch.mean(topk_values, dim=1).cpu().numpy()  # (N_test,)
-    
     # ====== IMAGE-LEVEL: KNN su avgpool (streaming, no N×M) ======
-    X = torch.flatten(test_outputs['avgpool'], 1).to(torch.float32)   # (N_test, D)
-    Y = torch.flatten(train_outputs['avgpool'], 1).to(torch.float32)  # (N_train, D)
+    X = torch.flatten(test_outputs['avgpool'], 1).to(torch.float32)
+    Y = torch.flatten(train_outputs['avgpool'], 1).to(torch.float32)
 
     topk_values, topk_indexes = topk_cdist_streaming(
         X, Y, k=TOP_K,
-        block_x=1024,      # ↑ o ↓ in base alla tua GPU
-        block_y=4096,      # ↑ o ↓ in base alla tua GPU
-        device=device,     # 'cuda' o 'cpu'
-        use_amp=True       # True se hai CUDA; su CPU viene ignorato
+        block_x=1024,
+        block_y=4096,
+        device=device,
+        use_amp=True
     )
 
     img_scores = topk_values.mean(dim=1).cpu().numpy()
-    
+
     fpr, tpr, thresholds = roc_curve(gt_np, img_scores)
     auc_img = roc_auc_score(gt_np, img_scores)
-    
     print(f"[image-level] ROC-AUC ({CODICE_PEZZO}/train={TRAIN_TAG}): {auc_img:.3f}")
-    
-    # find the best treshold for the classifcation according to Youden's J
-    J = tpr-fpr
+
+    J = tpr - fpr
     best_idx = int(np.argmax(J))
     best_thr = float(thresholds[best_idx])
 
-    # Predizioni a soglia Youden
     preds = (img_scores >= best_thr).astype(np.int32)
-
     tn, fp, fn, tp = confusion_matrix(gt_np, preds, labels=[0, 1]).ravel()
     print(f"[image-level] soglia (Youden) = {best_thr:.6f}")
     print(f"[image-level] CM -> TN:{tn}  FP:{fp}  FN:{fn}  TP:{tp}")
     print(f"[image-level] TPR:{tpr[best_idx]:.3f}  FPR:{fpr[best_idx]:.3f}")
 
-    fig, ax = plt.subplots(1, 2, figsize=(20, 10))
-    fig_img_rocauc = ax[0]
-    fig_pixel_rocauc = ax[1]
-
     fig, ax = plt.subplots(1, 2, figsize=(10, 4))
     ax[0].plot(fpr, tpr, label=f"AUC={roc_auc_score(gt_list, img_scores):.3f}")
     ax[0].plot([0,1],[0,1],'k--',linewidth=1)
     ax[0].set_title("Image-level ROC"); ax[0].set_xlabel("FPR"); ax[0].set_ylabel("TPR"); ax[0].legend()
-
     plt.tight_layout(); plt.show()
 
-    # --- SHOW IMAGES ---
-    N = len(gt_np)
-    per_page = 2         
-    cols = 4
-    
     print(f"[check] len(val_loader.dataset) = {len(val_loader.dataset)}")
     print(f"[check] len(scores)             = {len(img_scores)}")
 
@@ -296,64 +267,53 @@ def main():
             overlay=True, overlay_alpha=0.45
         )
 
-    
     # ---- PIXEL LEVEL FEATURES --------------------------
     score_map_list = []
     for t_idx in tqdm(range(test_outputs['avgpool'].shape[0]), '| localization | test | %s |' % CODICE_PEZZO):
         per_layer_maps = []
-        for layer_name in ['layer1', 'layer2', 'layer3']:  # layer usati per localization
-            # K vicini per questa immagine (dagli indici image-level)
+        for layer_name in ['layer1', 'layer2', 'layer3']:
             K = topk_indexes.shape[1]
 
-            # estraggo feature map dei K vicini e della test
             topk_feat = train_outputs[layer_name][topk_indexes[t_idx]].to(device)   # (K,C,H,W)
             test_feat = test_outputs[layer_name][t_idx:t_idx + 1].to(device)        # (1,C,H,W)
 
-            # L2-norm sul canale → distanza cosine-like più stabile
             topk_feat = l2norm(topk_feat, dim=1)
             test_feat = l2norm(test_feat, dim=1)
 
             K_, C, H, W = topk_feat.shape
 
-            # Galleria: tutti i pixel di tutti i K vicini → (K*H*W, C)
             gallery = topk_feat.permute(0, 2, 3, 1).reshape(K_*H*W, C).contiguous()
-            # Query: tutti i pixel della test → (H*W, C)
             query   = test_feat.permute(0, 2, 3, 1).reshape(H*W, C).contiguous()
 
-            # cdist a blocchi
             B = 20000
             mins = []
             for s in range(0, gallery.shape[0], B):
                 d = torch.cdist(gallery[s:s+B], query)     # (B, H*W)
-                mins.append(d.min(dim=0).values)           # min su galleria per ciascun pixel test
+                mins.append(d.min(dim=0).values)
             dist_min = torch.stack(mins, dim=0).min(dim=0).values  # (H*W,)
 
-            # mappa (H,W) → upsample a 224
             score_map = dist_min.view(1, 1, H, W)
             score_map = F.interpolate(score_map, size=IMG_SIZE, mode='bilinear', align_corners=False)
             per_layer_maps.append(score_map.cpu())
 
-        # media tra layer (texture + semantica)
         score_map = torch.mean(torch.cat(per_layer_maps, dim=0), dim=0)  # (1,1,224,224)
         score_map = score_map.squeeze().numpy()
         if GAUSSIAN_SIGMA > 0:
             score_map = gaussian_filter(score_map, sigma=GAUSSIAN_SIGMA)
         score_map_list.append(score_map)
-        
-    # ---- Valutazione & visualizzazione (riusabile dai tuoi altri metodi) ----
+
+    # ---- Valutazione & visualizzazione ----
     results = run_pixel_level_evaluation(
         score_map_list=score_map_list,
         val_set=val_set,
         img_scores=img_scores,
-        use_threshold="pro",   # "roc" | "pr" | "pro"
-        fpr_limit=0.01,         
+        use_threshold="pro",
+        fpr_limit=0.01,
         vis=True,
         vis_ds_or_loader=val_loader.dataset
     )
-
     print_pixel_report(results, title=f"{METHOD} | {CODICE_PEZZO}/train={TRAIN_TAG}")
-    
-    
-        
+
+
 if __name__ == "__main__":
     main()
