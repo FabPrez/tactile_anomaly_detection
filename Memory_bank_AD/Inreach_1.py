@@ -70,6 +70,7 @@ def measure_distances(features_a: torch.Tensor, features_b: torch.Tensor) -> tor
     """
     return torch.cdist(torch.permute(features_a, (1, 0)), torch.permute(features_b, (1, 0)))
 
+
 def super_seed(seed: int):
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
@@ -80,6 +81,7 @@ def super_seed(seed: int):
     random.seed(seed)
     np.random.seed(seed)
 
+
 def test_for_positional_class_transpose(imgs: List[np.ndarray]) -> float:
     """
     Test repo: media immagini vs immagine trasposta. Se differenza quadratica media è bassa,
@@ -89,6 +91,7 @@ def test_for_positional_class_transpose(imgs: List[np.ndarray]) -> float:
     average_f = np.transpose(average, (1, 0, 2))
     return float(np.mean(np.square(average.astype(np.float16) - average_f.astype(np.float16))))
 
+
 def test_for_positional_class_flips(imgs: List[np.ndarray]) -> float:
     """
     Variante col flip (non usata nel gate sotto, lasciata per allineamento repo).
@@ -96,6 +99,7 @@ def test_for_positional_class_flips(imgs: List[np.ndarray]) -> float:
     average = np.mean(np.array(imgs), axis=0, keepdims=False)
     average_f = np.flip(np.flip(average, (0)), (1))
     return float(np.mean(np.square(average.astype(np.float16) - average_f.astype(np.float16))))
+
 
 def align_images(seed: np.ndarray,
                  images: List[np.ndarray],
@@ -134,6 +138,7 @@ def align_images(seed: np.ndarray,
 
     return proposed_data_corrupted_images, proposed_used_test_masks
 
+
 def positional_test_and_alignment(images: List[np.ndarray],
                                   threashold: float,
                                   masks: Optional[List[np.ndarray]] = None,
@@ -156,8 +161,10 @@ def positional_test_and_alignment(images: List[np.ndarray],
         return False, images, masks, False
     return True, images, masks, False
 
+
 # ---------------- MODEL LOADER (repo-like torch.hub v0.10.0) ----------------
 from torchvision.models.feature_extraction import create_feature_extractor
+
 
 def load_wide_resnet_50(return_nodes: Dict[str, str] = None,
                         verbose: bool = False,
@@ -177,8 +184,10 @@ def load_wide_resnet_50(return_nodes: Dict[str, str] = None,
     model.eval()
     return model
 
+
 # ---------------- FeatureDescriptors (repo) con NO ImageNet normalize ----------------
 import abc
+
 
 class Preprocessing(torch.nn.Module):
     def __init__(self, input_dims, output_dim):
@@ -193,6 +202,7 @@ class Preprocessing(torch.nn.Module):
             _features.append(module(feature))
         return torch.stack(_features, dim=1)
 
+
 class MeanMapper(torch.nn.Module):
     def __init__(self, preprocessing_dim):
         super().__init__()
@@ -204,9 +214,11 @@ class MeanMapper(torch.nn.Module):
         features = features.reshape(len(features), 1, -1)
         return F.adaptive_avg_pool1d(features, self.preprocessing_dim).squeeze(1)
 
+
 class PatchMakerFD:
     def __init__(self, patchsize, stride=None):
         self.patchsize = patchsize
+        # FIX: niente uso di self.stride prima dell'assegnazione
         self.stride = 1 if stride is None else stride
 
     def patchify(self, features, return_spatial_info=False):
@@ -228,6 +240,7 @@ class PatchMakerFD:
             return unfolded_features, number_of_total_patches
         return unfolded_features
 
+
 class Aggregator(torch.nn.Module):
     def __init__(self, target_dim):
         super().__init__()
@@ -238,13 +251,15 @@ class Aggregator(torch.nn.Module):
         features = F.adaptive_avg_pool1d(features, self.target_dim)
         return features.reshape(len(features), -1)
 
+
 class Feautre_Descriptor(abc.ABC):
     """
     Versione repo con UNA modifica: image_net_norm() rimpiazzata da scaling 0..1 (NO ImageNet normalize).
     """
+
     def __init__(self,
-                 model : torch.nn.Module,
-                 image_size: tuple = (224,224,3),
+                 model: torch.nn.Module,
+                 image_size: tuple = (224, 224, 3),
                  flatten_output: bool = True,
                  positional_embeddings: float = 5.0,
                  pretrain_embed_dimension: int = 1024,
@@ -259,17 +274,18 @@ class Feautre_Descriptor(abc.ABC):
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         test_image = torch.from_numpy(
-            np.transpose(np.zeros(shape=(1, *image_size), dtype=np.float32), axes=[0, 3, 1, 2])
+            np.transpose(
+                np.zeros(shape=(1, *image_size), dtype=np.float32),
+                axes=[0, 3, 1, 2]
+            )
         ).to(device)
         with torch.no_grad():
             features = self.model(test_image)
         self.feature_size = [(features[layer].size(2), features[layer].size(3)) for layer in features.keys()]
 
         self.patch_maker = PatchMakerFD(patchsize=agg_size, stride=agg_stride)
-        self.agg_preprocessing = Preprocessing(
-            [features[layer].size(1) for layer in features.keys()],
-            self.pretrain_embed_dimension
-        )
+        self.agg_preprocessing = Preprocessing([features[layer].size(1) for layer in features.keys()],
+                                               self.pretrain_embed_dimension)
         self.pre_adapt_aggregator = Aggregator(target_dim=self.target_embed_dimension)
 
     def image_net_norm(self, image: np.ndarray) -> torch.Tensor:
@@ -288,9 +304,7 @@ class Feautre_Descriptor(abc.ABC):
         device = next(self.model.parameters()).device
         with torch.no_grad():
             output = []
-            for _, image in enumerate(tqdm(images, ncols=100,
-                                           desc='Gen Feature Descriptors',
-                                           disable=quite)):
+            for _, image in enumerate(tqdm(images, ncols=100, desc='Gen Feature Descriptors', disable=quite)):
                 x = self.image_net_norm(image).to(device)
                 feats_dict = self.model(x)
                 features_list = [feats_dict[layer] for layer in feats_dict.keys()]  # in ordine
@@ -298,7 +312,7 @@ class Feautre_Descriptor(abc.ABC):
                 # Patchify per ogni layer + info (Hi, Wi)
                 features_pw = [self.patch_maker.patchify(x, return_spatial_info=True) for x in features_list]
                 patch_shapes = [x[1] for x in features_pw]
-                features_pw  = [x[0] for x in features_pw]  # [B, L, C, ps, ps] per layer
+                features_pw = [x[0] for x in features_pw]  # [B, L, C, ps, ps] per layer
 
                 ref_num_patches = patch_shapes[0]  # [Href, Wref]
                 # Riallinea ogni layer alla griglia ref via bilinear
@@ -322,7 +336,7 @@ class Feautre_Descriptor(abc.ABC):
                         *perm_base_shape[:-2], ref_num_patches[0], ref_num_patches[1]
                     )  # [B, C, ps, ps, Href, Wref]
                     _features = _features.permute(0, -2, -1, 1, 2, 3)  # [B, Href, Wref, C, ps, ps]
-                    _features = _features.reshape(len(_features), -1, *_features.shape[-3:])
+                    _features = _features.reshape(len(_features), -1, *_features.shape[-3:])  # [B, Lref, C, ps, ps]
                     features_pw[i] = _features
 
                 # appiattisci per layer a (B*Lref, C, ps, ps)
@@ -332,10 +346,7 @@ class Feautre_Descriptor(abc.ABC):
                 mapped = self.agg_preprocessing(features_pw)  # [B*Lref per layer -> aggregato per layer]
                 pooled = self.pre_adapt_aggregator(mapped)    # [B*Lref, target_dim]
                 # Rimetti a [Href, Wref, D]
-                pooled = torch.reshape(
-                    pooled,
-                    (*self.feature_size[0], self.target_embed_dimension)
-                )  # (Href, Wref, D)
+                pooled = torch.reshape(pooled, (*self.feature_size[0], self.target_embed_dimension))  # (Href, Wref, D)
                 output.append(pooled.unsqueeze(0).cpu())  # Store su CPU per risparmiare GPU
 
                 del feats_dict, features_list, features_pw, mapped, pooled, x
@@ -350,12 +361,12 @@ class Feautre_Descriptor(abc.ABC):
             if self.positional_embeddings > 0:
                 with torch.no_grad():
                     # canale Y: rampa verticale normalizzata e scalata
-                    pos_y_vals = torch.arange(0, shape[2]).unsqueeze(0).unsqueeze(0).unsqueeze(3)
+                    pos_y_vals = torch.arange(0, shape[2]).unsqueeze(0).unsqueeze(0).unsqueeze(3)  # [1,1,H,1]
                     pos_y_vals = torch.mul(pos_y_vals, self.positional_embeddings / shape[2])
                     pos_y = pos_y_vals.repeat(shape[0], 1, 1, shape[3])  # [N,1,H,W]
 
                     # canale X: rampa orizzontale normalizzata e scalata
-                    pos_x_vals = torch.arange(0, shape[3]).unsqueeze(0).unsqueeze(0).unsqueeze(2)
+                    pos_x_vals = torch.arange(0, shape[3]).unsqueeze(0).unsqueeze(0).unsqueeze(2)  # [1,1,1,W]
                     pos_x_vals = torch.mul(pos_x_vals, self.positional_embeddings / shape[3])
                     pos_x = pos_x_vals.repeat(shape[0], 1, shape[2], 1)  # [N,1,H,W]
 
@@ -368,21 +379,22 @@ class Feautre_Descriptor(abc.ABC):
 
         return output
 
+
 # ---------------- InReaCh (repo) con gate inline e NO ImageNet normalize ----------------
 class InReaCh:
-    def __init__(self, 
-                 images: List[np.ndarray], 
-                 model : torch.nn.Module,
+    def __init__(self,
+                 images: List[np.ndarray],
+                 model: torch.nn.Module,
                  assoc_depth: int = 10,
                  min_channel_length: int = 3,
                  max_channel_std: float = 5.0,
-                 masks: Optional[List[np.ndarray]] = None, 
+                 masks: Optional[List[np.ndarray]] = None,
                  quite: bool = False,
                  pos_embed_thresh: float = 600.0,
                  pos_embed_weight: float = 5.0,
                  filter_size: float = 5,
                  **kwargs) -> None:
-        
+
         self.quite = quite
         self.images = images
         self.masks = masks
@@ -394,20 +406,25 @@ class InReaCh:
         self.max_channel_std = max_channel_std
 
         # Gate PE e allineamento ATTIVO (align=True) come flusso ufficiale
-        self.pos_embed_flag, self.images, self.masks, self.aligment_flag = positional_test_and_alignment(
+        pos_flag, aligned_images, new_masks, alignment_flag = positional_test_and_alignment(
             images=self.images,
             threashold=pos_embed_thresh,
             masks=self.masks,
-            align=True,            # repo-like
+            align=True,
             quite=self.quite
         )
-        # 🔧 Patch repo-faithful:
-        # se l'utente non ha passato maschere a __init__ (masks=None),
-        # ignoriamo eventuali liste di None restituite dall'allineamento.
-        if masks is None:
-            self.masks = None
-
+        self.pos_embed_flag = pos_flag
+        self.images = aligned_images
+        self.aligment_flag = alignment_flag
         self.pos_embed_weight = float(pos_embed_weight) if self.pos_embed_flag else 0.0
+
+        # Gestione robusta maschere:
+        # - se masks è None (come nel tuo script), ignoriamo qualunque cosa ritorni il gate
+        # - se masks non è None, usiamo la versione allineata (new_masks), se esiste
+        if masks is None or new_masks is None:
+            self.masks = None
+        else:
+            self.masks = new_masks
 
         # Feature Extraction (NO ImageNet normalize)
         self.fd_gen = Feautre_Descriptor(
@@ -418,9 +435,9 @@ class InReaCh:
         )
         self.patches = self.fd_gen.generate_descriptors(self.images, quite=self.quite)  # [N, D, L]
         self.cpu_patches = self.patches.cpu().numpy().astype(np.float32, copy=False)
-        
+
         # Se ho maschere, prepara contatori precision/recall per canali
-        if self.masks is not None:
+        if self.masks is not None and len(self.masks) > 0 and self.masks[0] is not None:
             L = self.cpu_patches.shape[2]
             side = int(np.sqrt(L))
             self.patch_shape = (side, side)
@@ -431,25 +448,29 @@ class InReaCh:
             self.negatives = (np.count_nonzero(self.masks) // 3) // max(1, self.scale)
             self.positives = L * self.cpu_patches.shape[0] - self.negatives
             self.max_label = int(np.max(np.array(self.masks)))
+        else:
+            # nessuna info di maschera -> no precision/recall a livello di canale
+            self.masks = None  # normalizziamo: se non utilizzabili, trattale come assenti
 
         # Costruisci i canali e l'indice FAISS
         self.gen_channels(self.quite)
 
-    def gen_assoc(self, targets: torch.Tensor, 
-                         sources: torch.Tensor, 
-                         target_img_index: int, 
-                         source_img_indexs: int):
+    def gen_assoc(self, targets: torch.Tensor,
+                  sources: torch.Tensor,
+                  target_img_index: int,
+                  source_img_indexs: int):
         """
         Mutual association tra 'targets' e 'sources' (entrambi [D, L]).
-        Restituisce array [L_targets, 5] con [idx_tgt, idx_src, dist_min, target_img_idx, source_img_idx] per match reciproci.
+        Restituisce array [L_targets, 5] con
+        [idx_tgt, idx_src, dist_min, target_img_idx, source_img_idx] per match reciproci.
         """
         device = targets.device
         t_len = targets.size(1)
         s_len = sources.size(1)
 
-        sources_zero_axis_min   = torch.full((t_len,), float('inf'), device=device)
+        sources_zero_axis_min = torch.full((t_len,), float('inf'), device=device)
         sources_zero_axis_index = torch.zeros((t_len,), device=device)
-        targets_ones_axis_min   = torch.full((s_len,), float('inf'), device=device)
+        targets_ones_axis_min = torch.full((s_len,), float('inf'), device=device)
         targets_ones_axis_index = torch.zeros((s_len,), device=device)
 
         # Gestione memoria: blocca in base a memoria disponibile (solo se CUDA disponibile)
@@ -490,7 +511,8 @@ class InReaCh:
         t1 = targets_ones_axis_min.detach().cpu().numpy().astype(np.float32)
         for x in range(targets_indexs.shape[0]):
             if sources_indexs[targets_indexs[x]] == x:
-                assoc[x] = np.array([x, targets_indexs[x], t1[x], target_img_index, source_img_indexs], dtype=np.float32)
+                assoc[x] = np.array([x, targets_indexs[x], t1[x], target_img_index, source_img_indexs],
+                                    dtype=np.float32)
             else:
                 assoc[x] = np.array([np.inf, np.inf, t1[x], np.inf, np.inf], dtype=np.float32)
 
@@ -512,8 +534,8 @@ class InReaCh:
             for x in range(len(patches)):
                 index = np.unravel_index(patches[x][2], shape=self.patch_shape)
                 if np.average(self.masks[patches[x][1]][
-                    index[0]*self.scale:(index[0]+1)*self.scale,
-                    index[1]*self.scale:(index[1]+1)*self.scale, :
+                    index[0] * self.scale:(index[0] + 1) * self.scale,
+                    index[1] * self.scale:(index[1] + 1) * self.scale, :
                 ]) == 0:
                     self.tp += 1
                 else:
@@ -521,7 +543,8 @@ class InReaCh:
 
     def gen_channels(self, quite: bool = False):
         # Colleziona associazioni
-        assoc = np.ones((self.assoc_depth, self.patches.size(0), self.patches.size(2), 5), dtype=np.float32) * np.inf
+        assoc = np.ones((self.assoc_depth, self.patches.size(0), self.patches.size(2), 5),
+                        dtype=np.float32) * np.inf
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         for seed_index in tq.tqdm(range(min(self.assoc_depth, self.patches.size(0))), ncols=100,
                                   desc='Associate To Channels', disable=quite):
@@ -596,18 +619,18 @@ class InReaCh:
             self.nn_object = faiss.IndexFlatL2(d)
         self.nn_object.add(base_np)
 
-    def predict(self, t_images: List[np.ndarray], 
-                t_masks: Optional[List[np.ndarray]] = None, 
+    def predict(self, t_images: List[np.ndarray],
+                t_masks: Optional[List[np.ndarray]] = None,
                 quite: bool = False):
         if self.aligment_flag:
             t_images, t_masks = align_images(self.images[0], t_images, t_masks, quite=quite)
 
         start = time.time()
         t_patches = self.fd_gen.generate_descriptors(t_images, quite=quite)  # [N, D, L]
-        
+
         scores = []
-        for test_img_index in tq.tqdm(range(t_patches.size(0)), ncols=100,
-                                      desc='Predicting On Images', disable=quite):
+        for test_img_index in tq.tqdm(range(t_patches.size(0)), ncols=100, desc='Predicting On Images',
+                                      disable=quite):
             q = torch.permute(t_patches[test_img_index], (1, 0)).contiguous().cpu().numpy().astype(np.float32)  # (L, D)
             dist, ind = self.nn_object.search(q, KNN_K)
             dist = dist[:, 0]
@@ -620,31 +643,32 @@ class InReaCh:
 
         if not quite:
             print('TIME TO COMPLETE all predictions', abs(start - time.time()))
-        
+
         return scores, t_masks
-         
-    def test(self,  t_images: List[np.ndarray], 
-                    t_masks: List[np.ndarray] = None, 
-                    quite: bool = False):
-        
+
+    def test(self, t_images: List[np.ndarray],
+             t_masks: List[np.ndarray] = None,
+             quite: bool = False):
+
         scores, t_masks = self.predict(t_images, t_masks=t_masks, quite=quite)
         if t_masks is None:
             raise ValueError("Per la valutazione pixel-level servono le maschere di verità a terra.")
 
         t_masks_bin = [(mask[:, :, 0] / 255.).astype(int) for mask in t_masks]
 
-        img_scores = [float(np.max(score)) for score in scores] 
-        img_masks  = [int(np.max(mask)) for mask in t_masks_bin]
+        img_scores = [float(np.max(score)) for score in scores]
+        img_masks = [int(np.max(mask)) for mask in t_masks_bin]
 
-        scores_flat  = np.array(scores, dtype=object)
-        scores_flat  = np.concatenate([s.flatten() for s in scores_flat]).astype(np.float32)
-        masks_flat   = np.concatenate([m.flatten() for m in t_masks_bin]).astype(np.int32)
+        scores_flat = np.array(scores, dtype=object)
+        scores_flat = np.concatenate([s.flatten() for s in scores_flat]).astype(np.float32)
+        masks_flat = np.concatenate([m.flatten() for m in t_masks_bin]).astype(np.int32)
 
         pxl_auroc = roc_auc_score(masks_flat, scores_flat)
         img_auroc = roc_auc_score(img_masks, img_scores)
         p, r = self.get_precision_recall()
 
         return pxl_auroc, img_auroc, p, r
+
 
 # ---------------- MAIN (integrazione con le tue utility) ----------------
 def _tensor_batch_to_uint8_images(x: torch.Tensor) -> List[np.ndarray]:
@@ -653,6 +677,7 @@ def _tensor_batch_to_uint8_images(x: torch.Tensor) -> List[np.ndarray]:
         x = (x.clamp(0, 1) * 255.0).to(torch.uint8)
     return [im for im in x.permute(0, 2, 3, 1).numpy()]
 
+
 def _tensor_batch_to_uint8_masks(m: torch.Tensor) -> List[np.ndarray]:
     m = m.detach().cpu()
     if m.ndim == 3:
@@ -660,6 +685,7 @@ def _tensor_batch_to_uint8_masks(m: torch.Tensor) -> List[np.ndarray]:
     if m.dtype != torch.uint8:
         m = (m > 0).to(torch.uint8) * 255
     return [mk for mk in m.numpy()]
+
 
 def main():
     super_seed(SEED)
@@ -746,7 +772,7 @@ def main():
 
     # image-level score: max
     img_scores = np.asarray([float(np.max(s)) for s in score_maps], dtype=np.float32)
-    y_true    = np.asarray(val_labels, dtype=np.int32)
+    y_true = np.asarray(val_labels, dtype=np.int32)
 
     fpr, tpr, thr = roc_curve(y_true, img_scores)
     auc_img = roc_auc_score(y_true, img_scores)
@@ -756,7 +782,7 @@ def main():
     best_idx = int(np.argmax(J))
     best_thr = float(thr[best_idx])
     preds = (img_scores >= best_thr).astype(np.int32)
-    tn, fp, fn, tp = confusion_matrix(y_true, preds, labels=[0,1]).ravel()
+    tn, fp, fn, tp = confusion_matrix(y_true, preds, labels=[0, 1]).ravel()
     print(f"[image-level] soglia (Youden) = {best_thr:.6f}")
     print(f"[image-level] CM -> TN:{tn}  FP:{fp}  FN:{fn}  TP:{tp}")
     print(f"[image-level] TPR:{tpr[best_idx]:.3f}  FPR:{fpr[best_idx]:.3f}")
@@ -780,6 +806,7 @@ def main():
         vis_ds_or_loader=val_loader.dataset
     )
     print_pixel_report(results, title=f"{METHOD} | {CODICE_PEZZO}/train={TRAIN_TAG}")
+
 
 if __name__ == "__main__":
     main()
