@@ -180,7 +180,7 @@ def debug_print_good_fraction_effective(meta):
 def main():
     # device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print("**device found:", device)
+    # print("**device found:", device)
 
     # ======== DATASETS & LOADERS (presi da data_loader) ========
     train_set, val_set, meta = build_ad_datasets(
@@ -351,6 +351,326 @@ def main():
     )
     print_pixel_report(results, title=f"{METHOD} | {CODICE_PEZZO}/train={TRAIN_TAG}")
 
+
+
+def run_single_experiment():
+    """
+    Esegue un esperimento completo SPADE usando le variabili globali:
+        CODICE_PEZZO
+        TRAIN_POSITIONS
+        VAL_GOOD_SCOPE
+        VAL_FAULT_SCOPE
+        VAL_GOOD_PER_POS
+        GOOD_FRACTION (dict o float)
+
+    Ritorna:
+        (image_auroc, pixel_auroc, pixel_auprc, pixel_aucpro)
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # print("**device found:", device)
+
+    # ======== DATASETS & LOADERS ========
+    train_set, val_set, meta = build_ad_datasets(
+        part=CODICE_PEZZO,
+        img_size=IMG_SIZE,
+        train_positions=TRAIN_POSITIONS,
+        val_fault_scope=VAL_FAULT_SCOPE,
+        val_good_scope=VAL_GOOD_SCOPE,
+        val_good_per_pos=VAL_GOOD_PER_POS,
+        good_fraction=GOOD_FRACTION,
+        seed=SEED,
+        transform=None,
+    )
+    TRAIN_TAG = meta["train_tag"]
+    # print("[meta]", meta)
+    # debug_print_good_fraction_effective(meta)
+
+    if VIS_VALID_DATASET:
+        show_dataset_images(val_set, batch_size=5, show_mask=True)
+
+    # print(f"Train GOOD (pos {meta['train_positions']}): {meta['counts']['train_good']}")
+    # print(f"Val   GOOD: {meta['counts']['val_good']}")
+    # print(f"Val  FAULT (pos {meta['val_fault_positions']}): {meta['counts']['val_fault']}")
+    # print(f"Val  TOT: {meta['counts']['val_total']}")
+
+    train_loader, val_loader = make_loaders(train_set, val_set, batch_size=32, device=device)
+
+    # ====== MODELLO + HOOK ======
+    weights = Wide_ResNet50_2_Weights.IMAGENET1K_V1
+    model   = wide_resnet50_2(weights=weights).to(device)
+    model.eval()
+
+    outputs = []
+    def hook(module, input, output):
+        outputs.append(output)
+
+    model.layer1[-1].register_forward_hook(hook)
+    model.layer2[-1].register_forward_hook(hook)
+    model.layer3[-1].register_forward_hook(hook)
+    model.avgpool.register_forward_hook(hook)
+
+    train_outputs = OrderedDict([('layer1', []), ('layer2', []), ('layer3', []), ('avgpool', [])])
+    test_outputs  = OrderedDict([('layer1', []), ('layer2', []), ('layer3', []), ('avgpool', [])])
+
+    # ====== TRAIN FEATURES (cache SOLO TRAIN) ======
+    try:
+        train_outputs = load_split_pickle(CODICE_PEZZO, TRAIN_TAG, split="train", method=METHOD)
+        print("[cache] Train features caricate da pickle.")
+    except FileNotFoundError:
+        print("[cache] Nessun pickle train: estraggo feature...")
+        for x, y, m in tqdm(train_loader, desc='| feature extraction | train | custom |'):
+            x = x.to(device, non_blocking=True)
+            with torch.no_grad():
+                _ = model(x)
+            for k, v in zip(train_outputs.keys(), outputs):
+                train_outputs[k].append(v.detach().cpu())
+            outputs = []
+        for k in train_outputs:
+            train_outputs[k] = torch.cat(train_outputs[k], dim=0)
+        # save_split_pickle(train_outputs, CODICE_PEZZO, TRAIN_TAG, split="train", method=METHOD)
+
+    # ====== VAL FEATURES ======
+    gt_list = []
+    for x, y, m in tqdm(val_loader, desc='| feature extraction | validation | custom |'):
+        gt_list.extend(y.cpu().numpy())
+        x = x.to(device, non_blocking=True)
+        with torch.no_grad():
+            _ = model(x)
+        for k, v in zip(test_outputs.keys(), outputs):
+            test_outputs[k].append(v.detach().cpu())
+        outputs = []
+    for k in test_outputs:
+        test_outputs[k] = torch.cat(test_outputs[k], dim=0)
+
+    gt_np = np.asarray(gt_list, dtype=np.int32)
+    for k in test_outputs:
+        assert test_outputs[k].shape[0] == len(gt_np), f"Mismatch batch su {k}"
+
+    # ====== IMAGE-LEVEL: KNN su avgpool ======
+    X = torch.flatten(test_outputs['avgpool'], 1).to(torch.float32)
+    Y = torch.flatten(train_outputs['avgpool'], 1).to(torch.float32)
+
+    topk_values, topk_indexes = topk_cdist_streaming(
+        X, Y, k=TOP_K,
+        block_x=1024,
+        block_y=4096,
+        device=device,
+        use_amp=True
+    )
+
+    img_scores = topk_values.mean(dim=1).cpu().numpy()
+
+    fpr, tpr, thresholds = roc_curve(gt_np, img_scores)
+    auc_img = roc_auc_score(gt_np, img_scores)
+
+    J = tpr - fpr
+    best_idx = int(np.argmax(J))
+    best_thr = float(thresholds[best_idx])
+    preds = (img_scores >= best_thr).astype(np.int32)
+    tn, fp, fn, tp = confusion_matrix(gt_np, preds, labels=[0, 1]).ravel()
+
+    # print(f"[image-level] ROC-AUC ({CODICE_PEZZO}/train={TRAIN_TAG}): {auc_img:.3f}")
+    # print(f"[image-level] soglia (Youden) = {best_thr:.6f}")
+    # print(f"[image-level] CM -> TN:{tn}  FP:{fp}  FN:{fn}  TP:{tp}")
+    # print(f"[image-level] TPR:{tpr[best_idx]:.3f}  FPR:{fpr[best_idx]:.3f}")
+
+    if VIS_PREDICTION_ON_VALID_DATASET:
+        show_validation_grid_from_loader(
+            val_loader, img_scores, preds,
+            per_page=4, samples_per_row=2,
+            show_mask=True, show_mask_product=True,
+            overlay=True, overlay_alpha=0.45
+        )
+
+    # ---- PIXEL LEVEL FEATURES ----
+    score_map_list = []
+    for t_idx in tqdm(range(test_outputs['avgpool'].shape[0]), '| localization | test | %s |' % CODICE_PEZZO):
+        per_layer_maps = []
+        for layer_name in ['layer1', 'layer2', 'layer3']:
+            K = topk_indexes.shape[1]
+
+            topk_feat = train_outputs[layer_name][topk_indexes[t_idx]].to(device)   # (K,C,H,W)
+            test_feat = test_outputs[layer_name][t_idx:t_idx + 1].to(device)        # (1,C,H,W)
+
+            topk_feat = l2norm(topk_feat, dim=1)
+            test_feat = l2norm(test_feat, dim=1)
+
+            K_, C, H, W = topk_feat.shape
+
+            gallery = topk_feat.permute(0, 2, 3, 1).reshape(K_*H*W, C).contiguous()
+            query   = test_feat.permute(0, 2, 3, 1).reshape(H*W, C).contiguous()
+
+            B = 20000
+            mins = []
+            for s in range(0, gallery.shape[0], B):
+                d = torch.cdist(gallery[s:s+B], query)     # (B, H*W)
+                mins.append(d.min(dim=0).values)
+            dist_min = torch.stack(mins, dim=0).min(dim=0).values  # (H*W,)
+
+            score_map = dist_min.view(1, 1, H, W)
+            score_map = F.interpolate(score_map, size=IMG_SIZE, mode='bilinear', align_corners=False)
+            per_layer_maps.append(score_map.cpu())
+
+        score_map = torch.mean(torch.cat(per_layer_maps, dim=0), dim=0)  # (1,1,224,224)
+        score_map = score_map.squeeze().numpy()
+        if GAUSSIAN_SIGMA > 0:
+            score_map = gaussian_filter(score_map, sigma=GAUSSIAN_SIGMA)
+        score_map_list.append(score_map)
+
+    # ---- Valutazione pixel-level (NO visual nelle sweep) ----
+    results = run_pixel_level_evaluation(
+        score_map_list=score_map_list,
+        val_set=val_set,
+        img_scores=img_scores,
+        use_threshold="pro",
+        fpr_limit=0.01,
+        vis=False,
+        vis_ds_or_loader=None
+    )
+
+    #image level stats
+    print(f"[image-level] ROC-AUC ({CODICE_PEZZO}/train={TRAIN_TAG}): {auc_img:.3f}")
+    print(f"[image-level] soglia (Youden) = {best_thr:.6f}")
+    print(f"[image-level] CM -> TN:{tn}  FP:{fp}  FN:{fn}  TP:{tp}")
+    print(f"[image-level] TPR:{tpr[best_idx]:.3f}  FPR:{fpr[best_idx]:.3f}")
+    
+    
+    print_pixel_report(results, title=f"{METHOD} | {CODICE_PEZZO}/train={TRAIN_TAG}")
+
+    pixel_auroc   = float(results["curves"]["roc"]["auc"])
+    pixel_auprc   = float(results["curves"]["pr"]["auprc"])
+    pixel_auc_pro = float(results["curves"]["pro"]["auc"])
+
+    return float(auc_img), pixel_auroc, pixel_auprc, pixel_auc_pro
+
+
+# ============================================================
+# ============   SWEEP SULLE FRAZIONI (UN PEZZO)   ===========
+# ============================================================
+def run_all_fractions_for_current_piece():
+    """
+    Esegue più esperimenti variando GOOD_FRACTION per il pezzo corrente (CODICE_PEZZO).
+    Adatta GOOD_FRACTION al formato dict per-posizione:
+        GOOD_FRACTION = {pos: frac}
+    dove 'pos' è la (o le) posizioni in TRAIN_POSITIONS.
+    """
+    global GOOD_FRACTION
+
+    # stesse frazioni usate per InReaCh (0.05 .. 1.0)
+    good_fracs = [
+        0.05, 0.10, 0.15, 0.20, 0.25,
+        0.30, 0.35, 0.40, 0.45, 0.50,
+        0.55, 0.60, 0.65, 0.70, 0.75,
+        0.80, 0.85, 0.90, 0.95, 1.00,
+    ]
+
+    img_list   = []
+    pxroc_list = []
+    pxpr_list  = []
+    pxpro_list = []
+
+    # userà tutte le posizioni in TRAIN_POSITIONS (tipicamente 1 per pezzo)
+    train_pos_list = list(TRAIN_POSITIONS)
+
+    for gf in good_fracs:
+        # costruiamo un dict GOOD_FRACTION per-posizione
+        GOOD_FRACTION = {pos: gf for pos in train_pos_list}
+
+        print(f"\n=== PEZZO {CODICE_PEZZO}, FRAZIONE {gf} ===")
+        auc_img, px_auroc, px_auprc, px_aucpro = run_single_experiment()
+
+        img_list.append(auc_img)
+        pxroc_list.append(px_auroc)
+        pxpr_list.append(px_auprc)
+        pxpro_list.append(px_aucpro)
+
+    print("\n### RISULTATI PER PEZZO", CODICE_PEZZO)
+    print("good_fractions      =", good_fracs)
+    print("image_level_AUROC   =", img_list)
+    print("pixel_level_AUROC   =", pxroc_list)
+    print("pixel_level_AUPRC   =", pxpr_list)
+    print("pixel_level_AUC_PRO =", pxpro_list)
+
+    return {
+        "good_fractions": good_fracs,
+        "image_auroc": img_list,
+        "pixel_auroc": pxroc_list,
+        "pixel_auprc": pxpr_list,
+        "pixel_auc_pro": pxpro_list,
+    }
+
+
+# ============================================================
+# ========   TUTTI I PEZZI × TUTTE LE FRAZIONI   =============
+# ============================================================
+def run_all_pieces_and_fractions():
+    """
+    Esegue TUTTI i pezzi e TUTTE le frazioni.
+    Usa variabili GLOBALI sovrascritte ogni volta:
+      - CODICE_PEZZO
+      - TRAIN_POSITIONS, VAL_GOOD_SCOPE, VAL_FAULT_SCOPE
+      - GOOD_FRACTION (costruito come dict per-posizione)
+    """
+    global CODICE_PEZZO, TRAIN_POSITIONS, VAL_GOOD_SCOPE, VAL_FAULT_SCOPE, GOOD_FRACTION
+
+    pieces = ["PZ1", "PZ2", "PZ3", "PZ4", "PZ5"]  # <-- scegli qui i pezzi
+    # pieces = ["PZ2"]  # esempio, come nel tuo InReaCh
+
+    all_results = {}
+
+    for pezzo in pieces:
+        CODICE_PEZZO = pezzo
+
+        if pezzo not in PIECE_TO_POSITION:
+            raise ValueError(f"Nessuna posizione definita in PIECE_TO_POSITION per il pezzo {pezzo}")
+
+        pos = PIECE_TO_POSITION[pezzo]
+
+        TRAIN_POSITIONS = [pos]
+        VAL_GOOD_SCOPE  = [pos]
+        VAL_FAULT_SCOPE = [pos]
+
+        print(f"\n\n============================")
+        print(f"   RUNNING PIECE: {CODICE_PEZZO}")
+        print(f"   POSITION:      {pos}")
+        print(f"============================")
+
+        res = run_all_fractions_for_current_piece()
+        all_results[pezzo] = res
+
+    print("\n\n========================================")
+    print("           RIEPILOGO TOTALE (SPADE)")
+    print("========================================\n")
+
+    for pezzo, res in all_results.items():
+        print(f"\n----- {pezzo} -----")
+        print("good_fractions      =", res["good_fractions"])
+        print("image_level_AUROC   =", res["image_auroc"])
+        print("pixel_level_AUROC   =", res["pixel_auroc"])
+        print("pixel_level_AUPRC   =", res["pixel_auprc"])
+        print("pixel_level_AUC_PRO =", res["pixel_auc_pro"])
+
+    return all_results
+
+
+    
+def main():
+    # ESEGUI UN SOLO ESPERIMENTO (usa le globali correnti)
+    # run_single_experiment()
+
+    # TUTTE LE FRAZIONI PER UN SOLO PEZZO
+    # CODICE_PEZZO = "PZ3"
+    # pos = PIECE_TO_POSITION[CODICE_PEZZO]
+    # TRAIN_POSITIONS[:] = [pos]
+    # VAL_GOOD_SCOPE[:]  = [pos]
+    # VAL_FAULT_SCOPE[:] = [pos]
+    # run_all_fractions_for_current_piece()
+
+    # TUTTI I PEZZI × TUTTE LE FRAZIONI
+    run_all_pieces_and_fractions()
+    
+    
+    
 
 if __name__ == "__main__":
     main()
