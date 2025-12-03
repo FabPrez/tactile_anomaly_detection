@@ -50,6 +50,7 @@ VAL_GOOD_PER_POS = 20
 #   "all_positions"  -> da tutte le pos del pezzo
 #   ["pos1","pos3"]  -> lista custom
 VAL_GOOD_SCOPE = ["pos1"]
+VAL_GOOD_SCOPE = ["pos1"]
 
 # Da quali posizioni prendere le FAULT per la VALIDATION:
 #   "train_only" | "all" | lista custom (es. ["pos1","pos2"])
@@ -150,6 +151,32 @@ def topk_cdist_streaming(X, Y, k=7, block_x=1024, block_y=4096, device=torch.dev
     return topk_values, topk_indexes
 
 
+# ---------- debug GOOD_FRACTION effettivo ----------
+def debug_print_good_fraction_effective(meta):
+    """
+    Stampa la GOOD_FRACTION effettiva per posizione,
+    cioè (good_train_after_fraction / good_total).
+    """
+    per_pos = meta.get("per_pos_counts", {})
+    if not per_pos:
+        print("\n[debug] GOOD_FRACTION effettivo: nessun dato per posizione.\n")
+        return
+
+    print("\n[debug] GOOD_FRACTION effettivo:")
+    for pos, stats in per_pos.items():
+        tot = stats.get("good_total", 0)
+        train_final = stats.get("good_train_after_fraction",
+                                stats.get("good_train", 0))
+
+        if tot > 0:
+            frac = train_final / tot
+        else:
+            frac = 0.0
+
+        print(f"  - {pos}: {frac:.3f} ({frac*100:.1f}%)")
+    print()
+
+
 def main():
     # device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -169,6 +196,7 @@ def main():
     )
     TRAIN_TAG = meta["train_tag"]
     print("[meta]", meta)
+    debug_print_good_fraction_effective(meta)
 
     if VIS_VALID_DATASET:
         show_dataset_images(val_set, batch_size=5, show_mask=True)
