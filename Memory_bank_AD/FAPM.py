@@ -32,7 +32,7 @@ except Exception:
 
 # ---------------- CONFIG ----------------
 METHOD               = "FAPM"     # nome metodo per salvataggio pickle (cartelle tue utility)
-CODICE_PEZZO         = "PZ4"
+CODICE_PEZZO         = "PZ3"
 
 TRAIN_POSITIONS      = ["pos1"]
 VAL_GOOD_PER_POS     = 20

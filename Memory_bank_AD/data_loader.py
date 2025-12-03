@@ -172,7 +172,7 @@ def get_items(
             continue
         else:
             total = len(list(img_dir.glob("*")))
-            print(f"[{part}/{pos}/{label}/{modality}] Trovati {len(imgs_here)} di {total} file in {img_dir.name}")
+            # print(f"[{part}/{pos}/{label}/{modality}] Trovati {len(imgs_here)} di {total} file in {img_dir.name}")
 
         # ----- FAULT: abbina immagini e maschere per INDICE -----
         if (label == "fault") and (modality == "rgb"):

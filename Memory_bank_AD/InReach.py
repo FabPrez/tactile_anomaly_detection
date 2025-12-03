@@ -12,6 +12,7 @@ import tqdm as tq
 import cv2
 
 import torch
+from torch.utils.data import Dataset
 import torch.nn.functional as F
 from sklearn.metrics import roc_auc_score, roc_curve, confusion_matrix
 from scipy.ndimage import gaussian_filter
@@ -33,13 +34,22 @@ torch.set_default_dtype(torch.float32)
 
 # ---------------- CONFIG ----------------
 METHOD = "INREACH_OFFICIAL"
-CODICE_PEZZO = "PZ2"
+CODICE_PEZZO = "PZ5"
 
-TRAIN_POSITIONS = ["pos5"]
+TRAIN_POSITIONS = ["pos1"]
 VAL_GOOD_PER_POS = 20
-VAL_GOOD_SCOPE   = ["pos5"]
-VAL_FAULT_SCOPE  = ["pos5"]
-GOOD_FRACTION    = 0.1
+VAL_GOOD_SCOPE   = ["pos1"]
+VAL_FAULT_SCOPE  = ["pos1"]
+GOOD_FRACTION    = 1.0
+
+# Mappa pezzo → posizione da usare
+PIECE_TO_POSITION = {
+    "PZ1": "pos1",
+    "PZ2": "pos5",
+    "PZ3": "pos1",
+    "PZ4": "pos1",
+    "PZ5": "pos1",
+}
 
 IMG_SIZE  = 224
 SEED      = 42
@@ -59,7 +69,7 @@ POS_EMBED_WEIGHT_ON      = 5.0     # fattore di scala dei due canali (y,x) quand
 
 # Visual
 VIS_VALID_DATASET               = False
-VIS_PREDICTION_ON_VALID_DATASET = True
+VIS_PREDICTION_ON_VALID_DATASET = False
 
 # -------------------- Inlined "utils.py" (repo) --------------------
 
@@ -125,11 +135,26 @@ def align_images(seed: np.ndarray,
         best = int(np.argmin(rotation_ideal))
         proposed_data_corrupted_images.append(cv2.warpAffine(image, r_mat[best], image_size))
         if masks is not None:
-            masks_rounded = cv2.warpAffine(masks[k], r_mat[best], image_size)
-            masks_rounded[masks_rounded > 128] = 255
-            masks_rounded[masks_rounded <= 128] = 0
+            mk = masks[k]
+
+            # assicuriamoci che sia 2D (H,W)
+            if mk.ndim == 3:
+                mk = mk[:, :, 0]
+
+            # float per warpAffine
+            mk = mk.astype(np.float32)
+
+            # rotazione SENZA interpolazione “strana” sui label
+            mk_warp = cv2.warpAffine(
+                mk, r_mat[best], image_size,
+                flags=cv2.INTER_NEAREST
+            )
+
+            # binarizza in 0/1
+            masks_rounded = (mk_warp > 0.5).astype(np.uint8)
         else:
             masks_rounded = None
+
         proposed_used_test_masks.append(masks_rounded)
 
     return proposed_data_corrupted_images, proposed_used_test_masks
@@ -207,7 +232,7 @@ class MeanMapper(torch.nn.Module):
 class PatchMakerFD:
     def __init__(self, patchsize, stride=None):
         self.patchsize = patchsize
-        self.stride = stride if self.stride is not None else 1 if stride is None else stride
+        self.stride = stride 
 
     def patchify(self, features, return_spatial_info=False):
         padding = int((self.patchsize - 1) / 2)
@@ -389,9 +414,13 @@ class InReaCh:
             images=self.images,
             threashold=pos_embed_thresh,
             masks=self.masks,
-            align=True,            # <— modificato: True
+            align=False,       
             quite=self.quite
         )
+        print("**** aligment_flag: ",self.aligment_flag)
+        print("**** pos_embed_flag: ",self.pos_embed_flag)
+        # self.aligment_flag = False
+        # self.pos_embed_flag = False
         self.pos_embed_weight = float(pos_embed_weight) if self.pos_embed_flag else 0.0
 
         # Feature Extraction (NO ImageNet normalize)
@@ -405,7 +434,10 @@ class InReaCh:
         self.cpu_patches = self.patches.cpu().numpy().astype(np.float32, copy=False)
         
         # Se ho maschere, prepara contatori precision/recall per canali
-        if self.masks is not None:
+        # if self.masks is None:
+            # print("mask is noneeeeee")
+        
+        if self.masks and any(m is not None for m in self.masks):
             L = self.cpu_patches.shape[2]
             side = int(np.sqrt(L))
             self.patch_shape = (side, side)
@@ -482,7 +514,7 @@ class InReaCh:
         return assoc
 
     def get_precision_recall(self):
-        if self.masks is not None:
+        if self.masks and any(m is not None for m in self.masks):
             precision = self.tp / (self.tp + self.fp) if (self.tp + self.fp) > 0 else 0.0
             recall = self.tp / self.positives if self.positives > 0 else 0.0
             return precision, recall
@@ -493,7 +525,7 @@ class InReaCh:
         """
         Aggiorna TP/FP valutando, per ciascun patch selezionato nel canale, se la corrispondente cella di mask è 'buona' (0) o anomala.
         """
-        if self.masks is not None:
+        if self.masks and any(m is not None for m in self.masks):
             for x in range(len(patches)):
                 index = np.unravel_index(patches[x][2], shape=self.patch_shape)
                 if np.average(self.masks[patches[x][1]][
@@ -581,14 +613,45 @@ class InReaCh:
             self.nn_object = faiss.IndexFlatL2(d)
         self.nn_object.add(base_np)
 
+    # def predict(self, t_images: List[np.ndarray], 
+    #             t_masks: Optional[List[np.ndarray]] = None, 
+    #             quite: bool = False):
+    #     if self.aligment_flag:
+    #         t_images, t_masks = align_images(self.images[0], t_images, t_masks, quite=quite)
+
+    #     start = time.time()
+    #     t_patches = self.fd_gen.generate_descriptors(t_images, quite=quite)  # [N, D, L]
+        
+    #     scores = []
+    #     for test_img_index in tq.tqdm(range(t_patches.size(0)), ncols=100, desc='Predicting On Images', disable=quite):
+    #         q = torch.permute(t_patches[test_img_index], (1, 0)).contiguous().cpu().numpy().astype(np.float32)  # (L, D)
+    #         dist, ind = self.nn_object.search(q, KNN_K)
+    #         dist = dist[:, 0]
+    #         side = int(np.sqrt(dist.shape[0]))
+    #         dist2d = np.resize(dist, new_shape=(side, side))
+    #         # === Upsampling stile repo: stesso fattore su H e W ===
+    #         rep = max(1, t_images[0].shape[0] // dist2d.shape[0])
+    #         dist_up = dist2d.repeat(rep, axis=0).repeat(rep, axis=1)
+    #         scores.append(gaussian_filter(dist_up, self.filter_size))
+
+    #     if not quite:
+    #         print('TIME TO COMPLETE all predictions', abs(start - time.time()))
+        
+    #     return scores, t_masks
+    
     def predict(self, t_images: List[np.ndarray], 
-                t_masks: Optional[List[np.ndarray]] = None, 
-                quite: bool = False):
+            t_masks: Optional[List[np.ndarray]] = None, 
+            quite: bool = False):
+
+        # tieni copia esplicita delle liste allineate
         if self.aligment_flag:
-            t_images, t_masks = align_images(self.images[0], t_images, t_masks, quite=quite)
+            t_images_aligned, t_masks_aligned = align_images(self.images[0], t_images, t_masks, quite=quite)
+        else:
+            t_images_aligned, t_masks_aligned = t_images, t_masks
 
         start = time.time()
-        t_patches = self.fd_gen.generate_descriptors(t_images, quite=quite)  # [N, D, L]
+        # usa SEMPRE le immagini allineate per estrarre i descrittori
+        t_patches = self.fd_gen.generate_descriptors(t_images_aligned, quite=quite)  # [N, D, L]
         
         scores = []
         for test_img_index in tq.tqdm(range(t_patches.size(0)), ncols=100, desc='Predicting On Images', disable=quite):
@@ -597,15 +660,15 @@ class InReaCh:
             dist = dist[:, 0]
             side = int(np.sqrt(dist.shape[0]))
             dist2d = np.resize(dist, new_shape=(side, side))
-            # === Upsampling stile repo: stesso fattore su H e W ===
-            rep = max(1, t_images[0].shape[0] // dist2d.shape[0])
+            rep = max(1, t_images_aligned[0].shape[0] // dist2d.shape[0])
             dist_up = dist2d.repeat(rep, axis=0).repeat(rep, axis=1)
             scores.append(gaussian_filter(dist_up, self.filter_size))
 
         if not quite:
             print('TIME TO COMPLETE all predictions', abs(start - time.time()))
         
-        return scores, t_masks
+        # RITORNA anche immagini allineate
+        return scores, t_masks_aligned, t_images_aligned
          
     def test(self,  t_images: List[np.ndarray], 
                     t_masks: List[np.ndarray] = None, 
@@ -726,7 +789,10 @@ def main():
             val_labels.extend(yb.detach().cpu().numpy().tolist())
 
     # inferenza
-    score_maps, val_masks_aligned = inreach.predict(val_imgs, t_masks=val_masks, quite=False)
+    # score_maps, val_masks_aligned = inreach.predict(val_imgs, t_masks=val_masks, quite=False)
+    print("UNIQUE val_masks[0] PRIMA di predict:", np.unique(val_masks[0]))
+    score_maps, val_masks_aligned, val_imgs_aligned = inreach.predict(val_imgs, t_masks=val_masks, quite=False)
+
 
     # image-level score: max
     img_scores = np.asarray([float(np.max(s)) for s in score_maps], dtype=np.float32)
@@ -734,36 +800,303 @@ def main():
 
     fpr, tpr, thr = roc_curve(y_true, img_scores)
     auc_img = roc_auc_score(y_true, img_scores)
-    print(f"[image-level] ROC-AUC ({CODICE_PEZZO}/train={TRAIN_TAG}): {auc_img:.3f}")
+    # print(f"[image-level] ROC-AUC ({CODICE_PEZZO}/train={TRAIN_TAG}): {auc_img:.3f}")
 
     J = tpr - fpr
     best_idx = int(np.argmax(J))
     best_thr = float(thr[best_idx])
     preds = (img_scores >= best_thr).astype(np.int32)
     tn, fp, fn, tp = confusion_matrix(y_true, preds, labels=[0,1]).ravel()
-    print(f"[image-level] soglia (Youden) = {best_thr:.6f}")
-    print(f"[image-level] CM -> TN:{tn}  FP:{fp}  FN:{fn}  TP:{tp}")
-    print(f"[image-level] TPR:{tpr[best_idx]:.3f}  FPR:{fpr[best_idx]:.3f}")
+    # print(f"[image-level] soglia (Youden) = {best_thr:.6f}")
+    # print(f"[image-level] CM -> TN:{tn}  FP:{fp}  FN:{fn}  TP:{tp}")
+    # print(f"[image-level] TPR:{tpr[best_idx]:.3f}  FPR:{fpr[best_idx]:.3f}")
 
+   
+    
+    aligned_val_set = AlignedValDataset(
+        imgs_u8_list=val_imgs_aligned,
+        masks_u8_list=val_masks_aligned,
+        labels_list=val_labels
+    )
+    
     if VIS_PREDICTION_ON_VALID_DATASET:
         show_validation_grid_from_loader(
-            val_loader, img_scores, preds,
+            aligned_val_set, img_scores, preds,
             per_page=4, samples_per_row=2,
             show_mask=True, show_mask_product=True,
             overlay=True, overlay_alpha=0.45
         )
-
-    # pixel-level (heatmap RAW)
+    
     results = run_pixel_level_evaluation(
         score_map_list=score_maps,
-        val_set=val_set,
+        val_set=aligned_val_set,            # <-- GT pixel-level dalle MASCHERE RUOTATE
         img_scores=img_scores.tolist(),
         use_threshold="pro",
         fpr_limit=0.01,
         vis=True,
-        vis_ds_or_loader=val_loader.dataset
+        vis_ds_or_loader=aligned_val_set    # <-- anche le immagini per la visual sono quelle RUOTATE
     )
+
+
+    # pixel-level (heatmap RAW)
+    # results = run_pixel_level_evaluation(
+    #     score_map_list=score_maps,
+    #     val_set=val_set,
+    #     img_scores=img_scores.tolist(),
+    #     use_threshold="pro",
+    #     fpr_limit=0.01,
+    #     vis=True,
+    #     vis_ds_or_loader=val_loader.dataset
+    # )
+    print(f"[image-level] ROC-AUC ({CODICE_PEZZO}/train={TRAIN_TAG}): {auc_img:.3f}")
+    print(f"[image-level] soglia (Youden) = {best_thr:.6f}")
+    print(f"[image-level] CM -> TN:{tn}  FP:{fp}  FN:{fn}  TP:{tp}")
+    print(f"[image-level] TPR:{tpr[best_idx]:.3f}  FPR:{fpr[best_idx]:.3f}")
+    
+    print_pixel_report(results, title=f"{METHOD} | {CODICE_PEZZO}/train={TRAIN_TAG}")
+    
+class AlignedValDataset(Dataset):
+    """
+    Dataset per validation: usa immagini e maschere ALLINEATE (numpy uint8 HxWx3/HxW)
+    + le label image-level che hai già (0=good,1=fault).
+    """
+    def __init__(self, imgs_u8_list, masks_u8_list, labels_list):
+        assert len(imgs_u8_list) == len(masks_u8_list) == len(labels_list)
+        self.imgs  = imgs_u8_list
+        self.masks = masks_u8_list
+        self.labels = labels_list
+
+    def __len__(self):
+        return len(self.imgs)
+
+    def __getitem__(self, idx):
+        img  = self.imgs[idx]
+        mask = self.masks[idx]
+        y    = int(self.labels[idx])
+
+        # img: HxWxC uint8 -> tensor [0,1]
+        if img.ndim == 2:
+            img = np.stack([img]*3, axis=-1)
+        img_t = torch.tensor(img, dtype=torch.float32).permute(2, 0, 1) / 255.0
+
+        # mask: HxW or HxWx1, 0/255 -> 0/1 uint8
+        if mask.ndim == 3:
+            mask = mask[:, :, 0]
+        mask_bin = (mask > 0).astype(np.uint8)
+        mask_t = torch.from_numpy(mask_bin)
+
+        label_t = torch.tensor(y, dtype=torch.long)
+        return img_t, label_t, mask_t
+    
+    
+def run_single_experiment():
+    """
+    Esegue un esperimento completo usando le variabili globali:
+        CODICE_PEZZO
+        GOOD_FRACTION
+    Ritorna:
+        (image_auroc, pixel_auroc, pixel_auprc, pixel_aucpro)
+    """
+    super_seed(SEED)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # ======= COSTRUZIONE DATASET =======
+    train_set, val_set, meta = build_ad_datasets(
+        part=CODICE_PEZZO,
+        img_size=IMG_SIZE,
+        train_positions=TRAIN_POSITIONS,
+        val_fault_scope=VAL_FAULT_SCOPE,
+        val_good_scope=VAL_GOOD_SCOPE,
+        val_good_per_pos=VAL_GOOD_PER_POS,
+        good_fraction=GOOD_FRACTION,
+        seed=SEED,
+        transform=None,
+    )
+    TRAIN_TAG = meta["train_tag"]
+    train_loader, val_loader = make_loaders(train_set, val_set, batch_size=32, device=device)
+
+    # ======= RACCOLTA TRAIN GOOD =======
+    train_imgs = []
+    with torch.inference_mode():
+        for xb, yb, mb in train_loader:
+            sel = (yb == 0)
+            if sel.any():
+                train_imgs.extend(_tensor_batch_to_uint8_images(xb[sel]))
+
+    # ======= MODELLO =======
+    return_nodes = {
+        'layer1.0.relu_2': 'Level_1','layer1.1.relu_2': 'Level_2','layer1.2.relu_2': 'Level_3',
+        'layer2.0.relu_2': 'Level_4','layer2.1.relu_2': 'Level_5','layer2.2.relu_2': 'Level_6',
+        'layer2.3.relu_2': 'Level_7','layer3.1.relu_2': 'Level_8','layer3.2.relu_2': 'Level_9',
+        'layer3.3.relu_2': 'Level_10','layer3.4.relu_2': 'Level_11','layer3.5.relu_2': 'Level_12',
+        'layer4.0.relu_2': 'Level_13',
+    }
+    model = load_wide_resnet_50(return_nodes=return_nodes, verbose=False)
+
+    inreach = InReaCh(
+        images=train_imgs,
+        model=model,
+        assoc_depth=ASSOC_DEPTH,
+        min_channel_length=MIN_CHANNEL_LENGTH,
+        max_channel_std=MAX_CHANNEL_STD,
+        filter_size=FILTER_SIZE,
+        pos_embed_thresh=POS_EMBED_THRESH_DEFAULT,
+        pos_embed_weight=POS_EMBED_WEIGHT_ON,
+    )
+
+    # ======= RACCOLTA VALIDAZIONE =======
+    val_imgs, val_masks, val_labels = [], [], []
+    with torch.inference_mode():
+        for xb, yb, mb in val_loader:
+            val_imgs.extend(_tensor_batch_to_uint8_images(xb))
+            val_masks.extend(_tensor_batch_to_uint8_masks(mb))
+            val_labels.extend(yb.cpu().numpy().tolist())
+
+    # ======= PREDIZIONE =======
+    score_maps, val_masks_aligned, val_imgs_aligned = inreach.predict(val_imgs, t_masks=val_masks, quite=False)
+
+    img_scores = np.asarray([float(np.max(s)) for s in score_maps], dtype=np.float32)
+    y_true = np.asarray(val_labels, dtype=np.int32)
+
+    # ======= IMAGE-LEVEL METRICA =======
+    auc_img = roc_auc_score(y_true, img_scores)
+
+    # ======= PIXEL-LEVEL =======
+    aligned_val_set = AlignedValDataset(val_imgs_aligned, val_masks_aligned, val_labels)
+    results = run_pixel_level_evaluation(
+        score_map_list=score_maps,
+        val_set=aligned_val_set,
+        img_scores=img_scores.tolist(),
+        use_threshold="pro",
+        fpr_limit=0.01,
+        vis=False,
+        vis_ds_or_loader=None
+    )
+
+    pixel_auroc   = float(results["curves"]["roc"]["auc"])
+    pixel_auprc   = float(results["curves"]["pr"]["auprc"])
+    pixel_auc_pro = float(results["curves"]["pro"]["auc"])
+    
+    # image level print
+    fpr, tpr, thr = roc_curve(y_true, img_scores)
+    J = tpr - fpr
+    best_idx = int(np.argmax(J))
+    best_thr = float(thr[best_idx])
+    preds = (img_scores >= best_thr).astype(np.int32)
+    tn, fp, fn, tp = confusion_matrix(y_true, preds, labels=[0,1]).ravel()
+    
+    print(f"[image-level] ROC-AUC ({CODICE_PEZZO}/train={TRAIN_TAG}): {auc_img:.3f}")
+    print(f"[image-level] soglia (Youden) = {best_thr:.6f}")
+    print(f"[image-level] CM -> TN:{tn}  FP:{fp}  FN:{fn}  TP:{tp}")
+    print(f"[image-level] TPR:{tpr[best_idx]:.3f}  FPR:{fpr[best_idx]:.3f}")
+    
+    # pixel level print
     print_pixel_report(results, title=f"{METHOD} | {CODICE_PEZZO}/train={TRAIN_TAG}")
 
+    return float(auc_img), pixel_auroc, pixel_auprc, pixel_auc_pro
+
+
+def run_all_fractions_for_current_piece():
+    """
+    Esegue più esperimenti variando GOOD_FRACTION.
+    Usa solo variabili GLOBALI.
+    """
+    global GOOD_FRACTION
+    good_fracs = [round(x/100, 3) for x in range(5, 25, 5)]
+    # good_fracs = [0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.7, 1.0]  # <-- modifica qui
+
+    img_list = []
+    pxroc_list = []
+    pxpr_list = []
+    pxpro_list = []
+
+    for gf in good_fracs:
+        GOOD_FRACTION = gf
+        print(f"\n=== PEZZO {CODICE_PEZZO}, FRAZIONE {GOOD_FRACTION} ===")
+        auc_img, px_auroc, px_auprc, px_aucpro = run_single_experiment()
+
+        img_list.append(auc_img)
+        pxroc_list.append(px_auroc)
+        pxpr_list.append(px_auprc)
+        pxpro_list.append(px_aucpro)
+
+    print("\n### RISULTATI PER PEZZO", CODICE_PEZZO)
+    print("good_fractions      =", good_fracs)
+    print("image_level_AUROC   =", img_list)
+    print("pixel_level_AUROC   =", pxroc_list)
+    print("pixel_level_AUPRC   =", pxpr_list)
+    print("pixel_level_AUC_PRO =", pxpro_list)
+
+    return {
+        "good_fractions": good_fracs,
+        "image_auroc": img_list,
+        "pixel_auroc": pxroc_list,
+        "pixel_auprc": pxpr_list,
+        "pixel_auc_pro": pxpro_list,
+    }
+
+def run_all_pieces_and_fractions():
+    """
+    Esegue TUTTI i pezzi e TUTTE le frazioni.
+    Usa solo variabili GLOBALI sovrascritte ogni volta:
+      - CODICE_PEZZO
+      - GOOD_FRACTION
+      - TRAIN_POSITIONS, VAL_GOOD_SCOPE, VAL_FAULT_SCOPE
+    """
+    global CODICE_PEZZO, TRAIN_POSITIONS, VAL_GOOD_SCOPE, VAL_FAULT_SCOPE
+
+    # pieces = ["PZ1", "PZ2", "PZ3", "PZ4", "PZ5"]  # <-- scegli qui i pezzi che vuoi
+    pieces = ["PZ2"]  # <-- scegli qui i pezzi che vuoi
+    
+    all_results = {}
+
+    for pezzo in pieces:
+        # 1) imposta il pezzo
+        CODICE_PEZZO = pezzo
+
+        # 2) leggi la posizione dalla mappa
+        if pezzo not in PIECE_TO_POSITION:
+            raise ValueError(f"Nessuna posizione definita in PIECE_TO_POSITION per il pezzo {pezzo}")
+
+        pos = PIECE_TO_POSITION[pezzo]
+
+        # 3) sovrascrivi le variabili globali di posizione
+        TRAIN_POSITIONS = [pos]
+        VAL_GOOD_SCOPE  = [pos]
+        VAL_FAULT_SCOPE = [pos]
+
+        print(f"\n\n============================")
+        print(f"   RUNNING PIECE: {CODICE_PEZZO}")
+        print(f"   POSITION:      {pos}")
+        print(f"============================")
+
+        # 4) esegui tutte le frazioni per questo pezzo
+        res = run_all_fractions_for_current_piece()
+        all_results[pezzo] = res
+
+    print("\n\n========================================")
+    print("           RIEPILOGO TOTALE")
+    print("========================================\n")
+
+    for pezzo, res in all_results.items():
+        print(f"\n----- {pezzo} -----")
+        print("good_fractions      =", res["good_fractions"])
+        print("image_level_AUROC   =", res["image_auroc"])
+        print("pixel_level_AUROC   =", res["pixel_auroc"])
+        print("pixel_level_AUPRC   =", res["pixel_auprc"])
+        print("pixel_level_AUC_PRO =", res["pixel_auc_pro"])
+
+    return all_results
+
+    
 if __name__ == "__main__":
-    main()
+
+    # SOLO 1 ESPERIMENTO (usa le globali) 
+    # run_single_experiment()
+
+    # TUTTE LE FRAZIONI PER UN SOLO PEZZO
+    # CODICE_PEZZO = "PZ1"
+    # run_all_fractions_for_current_piece()
+
+    # TUTTI I PEZZI × TUTTE LE FRAZIONI
+    run_all_pieces_and_fractions()

@@ -49,11 +49,11 @@ VAL_GOOD_PER_POS = 20
 #   "from_train"     -> solo dalle pos di TRAIN_POSITIONS
 #   "all_positions"  -> da tutte le pos del pezzo
 #   ["pos1","pos3"]  -> lista custom
-VAL_GOOD_SCOPE = ["pos1", "pos2"]
+VAL_GOOD_SCOPE = ["pos1"]
 
 # Da quali posizioni prendere le FAULT per la VALIDATION:
 #   "train_only" | "all" | lista custom (es. ["pos1","pos2"])
-VAL_FAULT_SCOPE = ["pos1", "pos2"]
+VAL_FAULT_SCOPE = ["pos1"]
 
 # Percentuale di GOOD (rimasti dopo aver tolto quelli per la val) da usare nel TRAIN.
 # Può essere:
@@ -64,7 +64,16 @@ VAL_FAULT_SCOPE = ["pos1", "pos2"]
 #      le pos non presenti nel dict usano 1.0 di default).
 GOOD_FRACTION = {
     "pos1": 0.2,   # 20% pos1
-    "pos2": 0.05,  # 5% pos2
+    # "pos2": 0.05,  # 5% pos2
+}
+
+# Mappa pezzo → posizione (una sola per pezzo, come in InReaCh)
+PIECE_TO_POSITION = {
+    "PZ1": "pos1",
+    "PZ2": "pos5",
+    "PZ3": "pos1",
+    "PZ4": "pos1",
+    "PZ5": "pos1",
 }
 
 # Modello / dati
@@ -74,7 +83,7 @@ SEED     = 42
 
 # Visualizzazioni
 VIS_VALID_DATASET = False
-VIS_PREDICTION_ON_VALID_DATASET = True
+VIS_PREDICTION_ON_VALID_DATASET = False
 GAUSSIAN_SIGMA = 4
 # ------------------------------------------
 
