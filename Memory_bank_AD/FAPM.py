@@ -40,6 +40,14 @@ VAL_GOOD_SCOPE       = ["pos1"]
 VAL_FAULT_SCOPE      = ["pos1"]
 GOOD_FRACTION        = 1.0  #0.2 #0.3 #0.5 #0.7  #1.0
 
+PIECE_TO_POSITION = {
+    "PZ1": "pos1",
+    "PZ2": "pos5",
+    "PZ3": "pos1",
+    "PZ4": "pos1",
+    "PZ5": "pos1",
+}
+
 IMG_SIZE             = 224
 SEED                 = 42
 
@@ -548,5 +556,214 @@ def main():
     print_pixel_report(results, title=f"{METHOD} | {CODICE_PEZZO}/train={TRAIN_TAG}")
 
 
+def run_single_experiment():
+    """
+    Esegue un esperimento completo usando le variabili globali:
+        CODICE_PEZZO
+        GOOD_FRACTION
+    Ritorna:
+        (image_auroc, pixel_auroc, pixel_auprc, pixel_aucpro)
+    """
+    # seed come nel main
+    torch.manual_seed(SEED)
+    random.seed(SEED)
+    np.random.seed(SEED)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # ======= DATASET =======
+    transform = None  # nessuna normalizzazione, come nel main
+
+    train_set, val_set, meta = build_ad_datasets(
+        part=CODICE_PEZZO,
+        img_size=IMG_SIZE,
+        train_positions=TRAIN_POSITIONS,
+        val_fault_scope=VAL_FAULT_SCOPE,
+        val_good_scope=VAL_GOOD_SCOPE,
+        val_good_per_pos=VAL_GOOD_PER_POS,
+        good_fraction=GOOD_FRACTION,
+        seed=SEED,
+        transform=transform,
+    )
+    TRAIN_TAG = meta["train_tag"]
+    # print("[meta]", meta)
+    # print(f"Train GOOD (pos {meta['train_positions']}): {meta['counts']['train_good']}")
+    # print(f"Val   GOOD: {meta['counts']['val_good']}")
+    # print(f"Val  FAULT (pos {meta['val_fault_positions']}): {meta['counts']['val_fault']}")
+    # print(f"Val  TOT: {meta['counts']['val_total']}")
+
+    # loaders (stessa logica del main)
+    train_loader, _ = make_loaders(train_set, val_set, batch_size=max(8, BATCH_TEST), device=device)
+    _, val_loader   = make_loaders(train_set, val_set, batch_size=1,                   device=device)
+
+    # ======= MODELLO =======
+    model = STPM(device=device).to(device).eval()
+
+    # ======= MEMORY (stessa logica del main, nessuna funzione nuova) =======
+    need_build = False
+    try:
+        mem_payload = load_split_pickle(CODICE_PEZZO, TRAIN_TAG, split="train", method=METHOD)
+        required = {
+            "final_near_core_c", "final_far_core_c",
+            "final_near_core_f", "final_far_core_f",
+            "fn_selector_c", "fn_selector_f"
+        }
+        if not required.issubset(set(mem_payload.keys())):
+            print("[pickle] trovato ma con chiavi non compatibili → rebuild")
+            need_build = True
+    except FileNotFoundError:
+        need_build = True
+
+    if need_build:
+        print("[pickle] Nessuna memory compatibile → build near/far + selector (repo-style)")
+        mem_payload = build_memory_payload(device, model, train_loader)
+        # save_split_pickle(mem_payload, CODICE_PEZZO, TRAIN_TAG, split="train", method=METHOD)
+        print("[pickle] Memory salvata (repo-style).")
+    else:
+        print("[pickle] Memory caricata da cache (repo-style).")
+
+    # ======= VALIDAZIONE =======
+    out = run_validation(device, model, val_loader, mem_payload)
+
+    img_scores = out["img_scores"]                 # (N_img,)
+    gt_img     = out["gt_img"].astype(np.int32)    # 0=good, 1=fault
+
+    # ======= IMAGE-LEVEL =======
+    fpr, tpr, thresholds = roc_curve(gt_img, img_scores)
+    auc_img = roc_auc_score(gt_img, img_scores)
+
+    J = tpr - fpr
+    best_idx = int(np.argmax(J))
+    best_thr = float(thresholds[best_idx])
+    preds = (img_scores >= best_thr).astype(np.int32)
+    tn, fp, fn, tp = confusion_matrix(gt_img, preds, labels=[0, 1]).ravel()
+
+    # ======= PIXEL-LEVEL (no visual per velocità) =======
+    results = run_pixel_level_evaluation(
+        score_map_list=list(out["raw_score_maps"]),
+        val_set=val_set,
+        img_scores=out["img_scores"],
+        use_threshold="pro",
+        fpr_limit=0.01,
+        vis=False,
+        vis_ds_or_loader=None
+    )
+
+    pixel_auroc   = float(results["curves"]["roc"]["auc"])
+    pixel_auprc   = float(results["curves"]["pr"]["auprc"])
+    pixel_auc_pro = float(results["curves"]["pro"]["auc"])
+    
+    
+    print(f"[image-level] ROC-AUC ({CODICE_PEZZO}/train={TRAIN_TAG}, good_frac={GOOD_FRACTION}): {auc_img:.3f}")
+    print(f"[image-level] soglia (Youden) = {best_thr:.6f}")
+    print(f"[image-level] CM -> TN:{tn}  FP:{fp}  FN:{fn}  TP:{tp}")
+    print(f"[image-level] TPR:{tpr[best_idx]:.3f}  FPR:{fpr[best_idx]:.3f}")
+
+    print_pixel_report(results, title=f"{METHOD} | {CODICE_PEZZO}/train={TRAIN_TAG} | gf={GOOD_FRACTION}")
+
+    return float(auc_img), pixel_auroc, pixel_auprc, pixel_auc_pro
+
+
+def run_all_fractions_for_current_piece():
+    """
+    Esegue più esperimenti variando GOOD_FRACTION per il pezzo corrente (CODICE_PEZZO).
+    Usa solo variabili GLOBALI.
+    """
+    global GOOD_FRACTION
+
+    # stessa griglia che hai usato per i risultati SPADE
+    good_fracs = [
+        0.05, 0.10, 0.15, 0.20, 0.25,
+        0.30, 0.35, 0.40, 0.45, 0.50,
+        0.55, 0.60, 0.65, 0.70, 0.75,
+        0.80, 0.85, 0.90, 0.95, 1.00,
+    ]
+
+    img_list   = []
+    pxroc_list = []
+    pxpr_list  = []
+    pxpro_list = []
+
+    for gf in good_fracs:
+        GOOD_FRACTION = gf
+        print(f"\n=== FAPM | PEZZO {CODICE_PEZZO}, FRAZIONE GOOD = {GOOD_FRACTION} ===")
+        auc_img, px_auroc, px_auprc, px_aucpro = run_single_experiment()
+
+        img_list.append(auc_img)
+        pxroc_list.append(px_auroc)
+        pxpr_list.append(px_auprc)
+        pxpro_list.append(px_aucpro)
+
+    print("\n### RISULTATI FAPM PER PEZZO", CODICE_PEZZO)
+    print("good_fractions      =", good_fracs)
+    print("image_level_AUROC   =", img_list)
+    print("pixel_level_AUROC   =", pxroc_list)
+    print("pixel_level_AUPRC   =", pxpr_list)
+    print("pixel_level_AUC_PRO =", pxpro_list)
+
+    return {
+        "good_fractions": good_fracs,
+        "image_auroc": img_list,
+        "pixel_auroc": pxroc_list,
+        "pixel_auprc": pxpr_list,
+        "pixel_auc_pro": pxpro_list,
+    }
+
+
+def run_all_pieces_and_fractions():
+    """
+    Esegue TUTTI i pezzi e TUTTE le frazioni.
+    Usa variabili GLOBALI sovrascritte ogni volta:
+      - CODICE_PEZZO
+      - TRAIN_POSITIONS, VAL_GOOD_SCOPE, VAL_FAULT_SCOPE
+    """
+    global CODICE_PEZZO, TRAIN_POSITIONS, VAL_GOOD_SCOPE, VAL_FAULT_SCOPE
+
+    # scegli qui i pezzi che vuoi far girare
+    pieces = ["PZ1", "PZ2", "PZ3", "PZ4", "PZ5"]
+
+    all_results = {}
+
+    for pezzo in pieces:
+        CODICE_PEZZO = pezzo
+
+        if pezzo not in PIECE_TO_POSITION:
+            raise ValueError(f"Nessuna posizione definita in PIECE_TO_POSITION per il pezzo {pezzo}")
+
+        pos = PIECE_TO_POSITION[pezzo]
+
+        TRAIN_POSITIONS = [pos]
+        VAL_GOOD_SCOPE  = [pos]
+        VAL_FAULT_SCOPE = [pos]
+
+        print(f"\n\n============================")
+        print(f"   FAPM - RUNNING PIECE: {CODICE_PEZZO}")
+        print(f"   POSITION:            {pos}")
+        print(f"============================")
+
+        res = run_all_fractions_for_current_piece()
+        all_results[pezzo] = res
+
+    print("\n\n========================================")
+    print("      FAPM - RIEPILOGO TOTALE")
+    print("========================================\n")
+
+    for pezzo, res in all_results.items():
+        print(f"\n----- {pezzo} -----")
+        print("good_fractions      =", res["good_fractions"])
+        print("image_level_AUROC   =", res["image_auroc"])
+        print("pixel_level_AUROC   =", res["pixel_auroc"])
+        print("pixel_level_AUPRC   =", res["pixel_auprc"])
+        print("pixel_level_AUC_PRO =", res["pixel_auc_pro"])
+
+    return all_results
+
+
 if __name__ == "__main__":
-    main()
+    # 1) SOLO 1 ESPERIMENTO (usa le globali in testa)
+    # main()
+
+    # 2) TUTTE LE FRAZIONI PER UN SOLO PEZZO (CODICE_PEZZO globale)
+    # run_all_fractions_for_current_piece()
+
+    # 3) TUTTI I PEZZI × TUTTE LE FRAZIONI
+    run_all_pieces_and_fractions()
