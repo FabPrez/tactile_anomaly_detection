@@ -49,7 +49,8 @@ PIECE_TO_POSITION = {
 }
 
 IMG_SIZE             = 224
-SEED                 = 42
+TEST_SEED  = 42  # controlla *solo* la scelta delle immagini di validation/test
+TRAIN_SEED = 1  # lo puoi cambiare tu per variare il sottoinsieme di GOOD usati per il training
 
 # Post-process
 GAUSSIAN_SIGMA       = 4          # smoothing post-heatmap
@@ -281,10 +282,10 @@ def build_memory_payload(
 
     # 2) costruisci near/far + selector per ciascun layer
     near_f, far_f, sel_f = _build_layer_memory(
-        fine_list, CORESET_RATIO, ADAPTIVE_RATIO, SELECTOR_PERCENTILE, SEED
+        fine_list, CORESET_RATIO, ADAPTIVE_RATIO, SELECTOR_PERCENTILE, TRAIN_SEED
     )
     near_c, far_c, sel_c = _build_layer_memory(
-        coarse_list, CORESET_RATIO, ADAPTIVE_RATIO, SELECTOR_PERCENTILE, SEED
+        coarse_list, CORESET_RATIO, ADAPTIVE_RATIO, SELECTOR_PERCENTILE, TRAIN_SEED
     )
 
     # 3) payload con chiavi repo
@@ -301,7 +302,7 @@ def build_memory_payload(
             "adaptive_ratio": float(ADAPTIVE_RATIO),
             "selector_percentile": float(SELECTOR_PERCENTILE),
             "k_nn": int(K_NN),
-            "seed": int(SEED),
+            "seed": int(TRAIN_SEED),
         }
     }
     return payload
@@ -449,9 +450,9 @@ def run_validation(
 
 # ==================== MAIN ====================
 def main():
-    torch.manual_seed(SEED)
-    random.seed(SEED)
-    np.random.seed(SEED)
+    torch.manual_seed(TRAIN_SEED)
+    random.seed(TRAIN_SEED)
+    np.random.seed(TRAIN_SEED)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Nessuna normalizzazione: transform=None
@@ -466,8 +467,10 @@ def main():
         val_good_scope=VAL_GOOD_SCOPE,
         val_good_per_pos=VAL_GOOD_PER_POS,
         good_fraction=GOOD_FRACTION,
-        seed=SEED,
-        transform=transform,
+        seed=TEST_SEED,
+        train_seed=TRAIN_SEED,
+        transform=None,
+        debug_print_val_paths=True,   # <<< accendi la stampa
     )
     TRAIN_TAG = meta["train_tag"]
     print("[meta]", meta)
@@ -565,9 +568,9 @@ def run_single_experiment():
         (image_auroc, pixel_auroc, pixel_auprc, pixel_aucpro)
     """
     # seed come nel main
-    torch.manual_seed(SEED)
-    random.seed(SEED)
-    np.random.seed(SEED)
+    torch.manual_seed(TRAIN_SEED)
+    random.seed(TRAIN_SEED)
+    np.random.seed(TRAIN_SEED)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # ======= DATASET =======
@@ -581,8 +584,10 @@ def run_single_experiment():
         val_good_scope=VAL_GOOD_SCOPE,
         val_good_per_pos=VAL_GOOD_PER_POS,
         good_fraction=GOOD_FRACTION,
-        seed=SEED,
-        transform=transform,
+        seed=TEST_SEED,
+        train_seed=TRAIN_SEED,
+        transform=None,
+        debug_print_val_paths=True,   # <<< accendi la stampa
     )
     TRAIN_TAG = meta["train_tag"]
     # print("[meta]", meta)
@@ -719,7 +724,9 @@ def run_all_pieces_and_fractions():
     global CODICE_PEZZO, TRAIN_POSITIONS, VAL_GOOD_SCOPE, VAL_FAULT_SCOPE
 
     # scegli qui i pezzi che vuoi far girare
-    pieces = ["PZ1", "PZ2", "PZ3", "PZ4", "PZ5"]
+    # pieces = ["PZ1", "PZ2", "PZ3", "PZ4", "PZ5"]
+    pieces = ["PZ4", "PZ5"]
+    
 
     all_results = {}
 

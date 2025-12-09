@@ -502,6 +502,7 @@ def build_ad_datasets(
     train_seed: int | None = None,
     transform=None,
     rgb_policy: Literal["prefer_320", "prefer_fullres", "fullres_only"] = "prefer_320",
+    debug_print_val_paths: bool = False,   # <<< NEW
 ):
     """
     Costruisce:
@@ -512,12 +513,6 @@ def build_ad_datasets(
     Il numero di GOOD in validation è controllato da val_good_per_pos.
     Il seed controlla la scelta casuale dei good spostati in validation (=> "test").
     Il train_seed controlla la scelta casuale del sottoinsieme di GOOD usato per il TRAIN.
-
-    Compatibilità con il comportamento precedente:
-      - se train_seed è None -> si usa un solo generatore (come prima)
-      - se train_seed == seed -> di nuovo un solo generatore, quindi
-        stessi split di prima a parità di seed.
-      - se train_seed != seed -> generatori diversi per validation e train.
     """
     T = _get_T()
 
@@ -553,10 +548,21 @@ def build_ad_datasets(
         rgb_policy=rgb_policy
     )
 
-    # >>> NEW: generatori separati ma compatibili
+    fault_val_paths = None
+    if debug_print_val_paths:
+        # stessi fault ma come Path, per sapere i nomi file
+        fault_val_paths, _ = get_items(
+            part, "rgb", label="fault", positions=val_fault_pos, return_type="path",
+            with_masks=True, mask_return_type="path", mask_binarize=True, mask_align="order",
+            rgb_policy=rgb_policy
+        )
+        print(f"\n[debug] FAULT in validation per {part}, posizioni {val_fault_pos}:")
+        for p in fault_val_paths:
+            print("   ", p.name)
+
+    # --- generatori separati ma compatibili ---
     rng_val = torch.Generator().manual_seed(seed)
     if train_seed is None or train_seed == seed:
-        # comportamento identico al vecchio codice: un solo generatore
         rng_train = rng_val
     else:
         rng_train = torch.Generator().manual_seed(train_seed)
@@ -565,11 +571,18 @@ def build_ad_datasets(
     val_sel_by_pos:   dict[str, list[Image.Image]] = {}
     per_pos_counts:   dict[str, dict] = {}
 
+    # NEW: path dei GOOD selezionati per validation, per posizione
+    val_sel_paths_by_pos: dict[str, list[Path]] = {}
+
     # 1) posizioni del TRAIN: splitto togliendo k per la val (usando rng_val)
     for pos in train_pos_list:
-        imgs_pos = get_items(part, "rgb", label="good", positions=[pos], return_type="pil",
-                             rgb_policy=rgb_policy)
+        # immagini come PIL
+        imgs_pos = get_items(
+            part, "rgb", label="good", positions=[pos], return_type="pil",
+            rgb_policy=rgb_policy
+        )
         n = len(imgs_pos)
+
         raw = float(k_map_raw.get(pos, 0.0)) if pos in val_good_pos else 0.0
         if raw <= 0.0:
             k = 0
@@ -584,6 +597,19 @@ def build_ad_datasets(
             idx = torch.randperm(n, generator=rng_val).tolist()
             sel  = [imgs_pos[i] for i in idx[:k]]
             keep = [imgs_pos[i] for i in idx[k:]]
+
+            if debug_print_val_paths:
+                # stessi file come Path, in ordine deterministico
+                paths_pos = get_items(
+                    part, "rgb", label="good", positions=[pos], return_type="path",
+                    rgb_policy=rgb_policy
+                )
+                sel_paths = [paths_pos[i] for i in idx[:k]]
+                val_sel_paths_by_pos[pos] = sel_paths
+
+                print(f"\n[debug] GOOD in validation per {part}/{pos} (da TRAIN):")
+                for p in sel_paths:
+                    print("   ", p.name)
         else:
             sel, keep = [], imgs_pos
 
@@ -598,8 +624,10 @@ def build_ad_datasets(
     # 2) posizioni extra per la validation (non in train), sempre con rng_val
     extra_val_pos = [p for p in val_good_pos if p not in train_pos_list]
     for pos in extra_val_pos:
-        imgs_pos = get_items(part, "rgb", label="good", positions=[pos], return_type="pil",
-                             rgb_policy=rgb_policy)
+        imgs_pos = get_items(
+            part, "rgb", label="good", positions=[pos], return_type="pil",
+            rgb_policy=rgb_policy
+        )
         n = len(imgs_pos)
         raw = float(k_map_raw.get(pos, 0.0))
         if raw <= 0.0:
@@ -610,11 +638,25 @@ def build_ad_datasets(
             else:
                 k = int(raw)
             k = _cap_warn(pos, k, n)
+
         if k > 0:
             idx = torch.randperm(n, generator=rng_val).tolist()
             sel = [imgs_pos[i] for i in idx[:k]]
+
+            if debug_print_val_paths:
+                paths_pos = get_items(
+                    part, "rgb", label="good", positions=[pos], return_type="path",
+                    rgb_policy=rgb_policy
+                )
+                sel_paths = [paths_pos[i] for i in idx[:k]]
+                val_sel_paths_by_pos[pos] = sel_paths
+
+                print(f"\n[debug] GOOD in validation per {part}/{pos} (solo VAL):")
+                for p in sel_paths:
+                    print("   ", p.name)
         else:
             sel = []
+
         val_sel_by_pos[pos] = sel
         per_pos_counts[pos] = {"good_total": n, "good_val": len(sel), "good_train": 0}
 
@@ -657,22 +699,30 @@ def build_ad_datasets(
     # mappa effettiva dei good spostati in validation per pos
     val_good_counts = {pos: len(sel) for pos, sel in val_sel_by_pos.items()}
 
+    # NEW: nomi file GOOD di validation per posizione
+    val_good_files = {
+        pos: [p.name for p in paths]
+        for pos, paths in val_sel_paths_by_pos.items()
+    }
+
     meta = {
         "train_tag": train_tag,
-        "good_fraction": good_fraction,              # può essere float o dict
+        "good_fraction": good_fraction,
         "train_positions": train_pos_list,
         "val_fault_positions": val_fault_pos,
         "val_good_scope": val_good_scope,
         "val_good_positions": val_good_pos,
-        "val_good_requested": k_map_raw,            # valori grezzi (float, frazione o count)
-        "val_good_per_pos": val_good_counts,        # valori effettivi (count per pos)
+        "val_good_requested": k_map_raw,
+        "val_good_per_pos": val_good_counts,
         "counts": {
             "train_good": len(good_train_ds),
             "val_good": len(good_val_selected),
             "val_fault": len(fault_val_ds),
             "val_total": (len(good_val_selected) + len(fault_val_ds)),
         },
-        "per_pos_counts": per_pos_counts
+        "per_pos_counts": per_pos_counts,
+        "val_good_files": val_good_files,                    # <<< NEW
+        "val_fault_files": [p.name for p in fault_val_paths] if fault_val_paths is not None else None,
     }
     return good_train_ds, val_set, meta
 

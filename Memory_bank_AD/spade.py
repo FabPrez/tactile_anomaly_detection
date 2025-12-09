@@ -81,7 +81,7 @@ IMG_SIZE = 224
 
 # >>> NEW: seed separati
 TEST_SEED  = 42  # controlla *solo* la scelta delle immagini di validation/test
-TRAIN_SEED = 42  # lo puoi cambiare tu per variare il sottoinsieme di GOOD usati per il training
+TRAIN_SEED = 2  # lo puoi cambiare tu per variare il sottoinsieme di GOOD usati per il training
 
 # Visualizzazioni
 VIS_VALID_DATASET = False
@@ -189,11 +189,12 @@ def main():
         train_positions=TRAIN_POSITIONS,
         val_fault_scope=VAL_FAULT_SCOPE,
         val_good_scope=VAL_GOOD_SCOPE,
-        val_good_per_pos=VAL_GOOD_PER_POS,   # ora può essere int/float/dict
-        good_fraction=GOOD_FRACTION,         # ora può essere float o dict per-posizione
-        seed=TEST_SEED,                      # seed fisso per la scelta delle immagini di validation/test
-        train_seed=TRAIN_SEED,               # seed separato per la scelta dei GOOD di train
+        val_good_per_pos=VAL_GOOD_PER_POS,
+        good_fraction=GOOD_FRACTION,
+        seed=TEST_SEED,
+        train_seed=TRAIN_SEED,
         transform=None,
+        debug_print_val_paths=False,   # <<< accendi la stampa
     )
     TRAIN_TAG = meta["train_tag"]
     print("[meta]", meta)
@@ -370,11 +371,14 @@ def run_single_experiment():
         val_good_scope=VAL_GOOD_SCOPE,
         val_good_per_pos=VAL_GOOD_PER_POS,
         good_fraction=GOOD_FRACTION,
-        seed=TEST_SEED,          # seed fisso per la parte di validation/test
-        train_seed=TRAIN_SEED,   # seed separato per la scelta casuale del sottoinsieme di train
+        seed=TEST_SEED,
+        train_seed=TRAIN_SEED,
         transform=None,
+        debug_print_val_paths=False,   # <<< accendi la stampa
     )
     TRAIN_TAG = meta["train_tag"]
+    # print(meta["val_good_files"])   # dict: posizione -> lista di filename GOOD in validation
+    # print(meta["val_fault_files"])  # lista di filename FAULT in validation (o None)    
 
     if VIS_VALID_DATASET:
         show_dataset_images(val_set, batch_size=5, show_mask=True)
@@ -591,6 +595,10 @@ def run_all_pieces_and_fractions():
     global CODICE_PEZZO, TRAIN_POSITIONS, VAL_GOOD_SCOPE, VAL_FAULT_SCOPE, GOOD_FRACTION
 
     pieces = ["PZ1", "PZ2", "PZ3", "PZ4", "PZ5"]
+    # pieces = ["PZ2", "PZ3", "PZ4", "PZ5"]
+    # pieces = ["PZ5"]
+    
+    
 
     all_results = {}
 
