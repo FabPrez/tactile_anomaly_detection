@@ -470,7 +470,7 @@ def main():
         seed=TEST_SEED,
         train_seed=TRAIN_SEED,
         transform=None,
-        debug_print_val_paths=True,   # <<< accendi la stampa
+        debug_print_val_paths=False,   # <<< accendi la stampa
     )
     TRAIN_TAG = meta["train_tag"]
     print("[meta]", meta)
@@ -587,7 +587,7 @@ def run_single_experiment():
         seed=TEST_SEED,
         train_seed=TRAIN_SEED,
         transform=None,
-        debug_print_val_paths=True,   # <<< accendi la stampa
+        debug_print_val_paths=False,   # <<< accendi la stampa
     )
     TRAIN_TAG = meta["train_tag"]
     # print("[meta]", meta)
@@ -724,8 +724,8 @@ def run_all_pieces_and_fractions():
     global CODICE_PEZZO, TRAIN_POSITIONS, VAL_GOOD_SCOPE, VAL_FAULT_SCOPE
 
     # scegli qui i pezzi che vuoi far girare
-    # pieces = ["PZ1", "PZ2", "PZ3", "PZ4", "PZ5"]
-    pieces = ["PZ4", "PZ5"]
+    pieces = ["PZ1", "PZ2", "PZ3", "PZ4", "PZ5"]
+    # pieces = ["PZ4", "PZ5"]
     
 
     all_results = {}
