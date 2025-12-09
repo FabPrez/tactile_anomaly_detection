@@ -50,7 +50,6 @@ VAL_GOOD_PER_POS = 20
 #   "all_positions"  -> da tutte le pos del pezzo
 #   ["pos1","pos3"]  -> lista custom
 VAL_GOOD_SCOPE = ["pos1"]
-VAL_GOOD_SCOPE = ["pos1"]
 
 # Da quali posizioni prendere le FAULT per la VALIDATION:
 #   "train_only" | "all" | lista custom (es. ["pos1","pos2"])
@@ -65,7 +64,6 @@ VAL_FAULT_SCOPE = ["pos1"]
 #      le pos non presenti nel dict usano 1.0 di default).
 GOOD_FRACTION = {
     "pos1": 0.2,   # 20% pos1
-    # "pos2": 0.05,  # 5% pos2
 }
 
 # Mappa pezzo → posizione (una sola per pezzo, come in InReaCh)
@@ -80,7 +78,10 @@ PIECE_TO_POSITION = {
 # Modello / dati
 TOP_K    = 5
 IMG_SIZE = 224
-SEED     = 42
+
+# >>> NEW: seed separati
+TEST_SEED  = 42  # controlla *solo* la scelta delle immagini di validation/test
+TRAIN_SEED = 42  # lo puoi cambiare tu per variare il sottoinsieme di GOOD usati per il training
 
 # Visualizzazioni
 VIS_VALID_DATASET = False
@@ -180,7 +181,6 @@ def debug_print_good_fraction_effective(meta):
 def main():
     # device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # print("**device found:", device)
 
     # ======== DATASETS & LOADERS (presi da data_loader) ========
     train_set, val_set, meta = build_ad_datasets(
@@ -191,7 +191,8 @@ def main():
         val_good_scope=VAL_GOOD_SCOPE,
         val_good_per_pos=VAL_GOOD_PER_POS,   # ora può essere int/float/dict
         good_fraction=GOOD_FRACTION,         # ora può essere float o dict per-posizione
-        seed=SEED,
+        seed=TEST_SEED,                      # seed fisso per la scelta delle immagini di validation/test
+        train_seed=TRAIN_SEED,               # seed separato per la scelta dei GOOD di train
         transform=None,
     )
     TRAIN_TAG = meta["train_tag"]
@@ -352,22 +353,13 @@ def main():
     print_pixel_report(results, title=f"{METHOD} | {CODICE_PEZZO}/train={TRAIN_TAG}")
 
 
-
 def run_single_experiment():
     """
-    Esegue un esperimento completo SPADE usando le variabili globali:
-        CODICE_PEZZO
-        TRAIN_POSITIONS
-        VAL_GOOD_SCOPE
-        VAL_FAULT_SCOPE
-        VAL_GOOD_PER_POS
-        GOOD_FRACTION (dict o float)
-
+    Esegue un esperimento completo SPADE usando le variabili globali.
     Ritorna:
         (image_auroc, pixel_auroc, pixel_auprc, pixel_aucpro)
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # print("**device found:", device)
 
     # ======== DATASETS & LOADERS ========
     train_set, val_set, meta = build_ad_datasets(
@@ -378,20 +370,14 @@ def run_single_experiment():
         val_good_scope=VAL_GOOD_SCOPE,
         val_good_per_pos=VAL_GOOD_PER_POS,
         good_fraction=GOOD_FRACTION,
-        seed=SEED,
+        seed=TEST_SEED,          # seed fisso per la parte di validation/test
+        train_seed=TRAIN_SEED,   # seed separato per la scelta casuale del sottoinsieme di train
         transform=None,
     )
     TRAIN_TAG = meta["train_tag"]
-    # print("[meta]", meta)
-    # debug_print_good_fraction_effective(meta)
 
     if VIS_VALID_DATASET:
         show_dataset_images(val_set, batch_size=5, show_mask=True)
-
-    # print(f"Train GOOD (pos {meta['train_positions']}): {meta['counts']['train_good']}")
-    # print(f"Val   GOOD: {meta['counts']['val_good']}")
-    # print(f"Val  FAULT (pos {meta['val_fault_positions']}): {meta['counts']['val_fault']}")
-    # print(f"Val  TOT: {meta['counts']['val_total']}")
 
     train_loader, val_loader = make_loaders(train_set, val_set, batch_size=32, device=device)
 
@@ -469,10 +455,10 @@ def run_single_experiment():
     preds = (img_scores >= best_thr).astype(np.int32)
     tn, fp, fn, tp = confusion_matrix(gt_np, preds, labels=[0, 1]).ravel()
 
-    # print(f"[image-level] ROC-AUC ({CODICE_PEZZO}/train={TRAIN_TAG}): {auc_img:.3f}")
-    # print(f"[image-level] soglia (Youden) = {best_thr:.6f}")
-    # print(f"[image-level] CM -> TN:{tn}  FP:{fp}  FN:{fn}  TP:{tp}")
-    # print(f"[image-level] TPR:{tpr[best_idx]:.3f}  FPR:{fpr[best_idx]:.3f}")
+    print(f"[image-level] ROC-AUC ({CODICE_PEZZO}/train={TRAIN_TAG}): {auc_img:.3f}")
+    print(f"[image-level] soglia (Youden) = {best_thr:.6f}")
+    print(f"[image-level] CM -> TN:{tn}  FP:{fp}  FN:{fn}  TP:{tp}")
+    print(f"[image-level] TPR:{tpr[best_idx]:.3f}  FPR:{fpr[best_idx]:.3f}")
 
     if VIS_PREDICTION_ON_VALID_DATASET:
         show_validation_grid_from_loader(
@@ -528,13 +514,6 @@ def run_single_experiment():
         vis_ds_or_loader=None
     )
 
-    #image level stats
-    print(f"[image-level] ROC-AUC ({CODICE_PEZZO}/train={TRAIN_TAG}): {auc_img:.3f}")
-    print(f"[image-level] soglia (Youden) = {best_thr:.6f}")
-    print(f"[image-level] CM -> TN:{tn}  FP:{fp}  FN:{fn}  TP:{tp}")
-    print(f"[image-level] TPR:{tpr[best_idx]:.3f}  FPR:{fpr[best_idx]:.3f}")
-    
-    
     print_pixel_report(results, title=f"{METHOD} | {CODICE_PEZZO}/train={TRAIN_TAG}")
 
     pixel_auroc   = float(results["curves"]["roc"]["auc"])
@@ -569,11 +548,9 @@ def run_all_fractions_for_current_piece():
     pxpr_list  = []
     pxpro_list = []
 
-    # userà tutte le posizioni in TRAIN_POSITIONS (tipicamente 1 per pezzo)
     train_pos_list = list(TRAIN_POSITIONS)
 
     for gf in good_fracs:
-        # costruiamo un dict GOOD_FRACTION per-posizione
         GOOD_FRACTION = {pos: gf for pos in train_pos_list}
 
         print(f"\n=== PEZZO {CODICE_PEZZO}, FRAZIONE {gf} ===")
@@ -613,8 +590,7 @@ def run_all_pieces_and_fractions():
     """
     global CODICE_PEZZO, TRAIN_POSITIONS, VAL_GOOD_SCOPE, VAL_FAULT_SCOPE, GOOD_FRACTION
 
-    pieces = ["PZ1", "PZ2", "PZ3", "PZ4", "PZ5"]  # <-- scegli qui i pezzi
-    # pieces = ["PZ2"]  # esempio, come nel tuo InReaCh
+    pieces = ["PZ1", "PZ2", "PZ3", "PZ4", "PZ5"]
 
     all_results = {}
 
@@ -653,8 +629,11 @@ def run_all_pieces_and_fractions():
     return all_results
 
 
-    
-def main():
+def entry_main():
+    """
+    Wrapper per scegliere facilmente cosa eseguire.
+    Puoi usare questo invece di main() se vuoi solo le sweep.
+    """
     # ESEGUI UN SOLO ESPERIMENTO (usa le globali correnti)
     # run_single_experiment()
 
@@ -668,9 +647,9 @@ def main():
 
     # TUTTI I PEZZI × TUTTE LE FRAZIONI
     run_all_pieces_and_fractions()
-    
-    
-    
+
 
 if __name__ == "__main__":
-    main()
+    # puoi scegliere se usare main() “vecchio” o entry_main()
+    # main()
+    entry_main()

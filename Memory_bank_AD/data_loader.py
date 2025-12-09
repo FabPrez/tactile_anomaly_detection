@@ -499,29 +499,29 @@ def build_ad_datasets(
     val_good_per_pos: int | float | dict | None,
     good_fraction: float | dict | None = 1.0,
     seed: int = 42,
+    train_seed: int | None = None,
     transform=None,
     rgb_policy: Literal["prefer_320", "prefer_fullres", "fullres_only"] = "prefer_320",
 ):
     """
-    - Se img_size è None => nessuna trasformazione di crop/resize (full-res).
-    - Se img_size è int => CenterCrop(img_size, img_size).
-    - Se img_size è (H, W) => CenterCrop((H, W)).
-    - Se transform è passato, viene rispettato e img_size viene ignorato.
+    Costruisce:
+      - train_set: solo GOOD (dalle posizioni train_positions),
+                   eventualmente con frazione per posizione good_fraction.
+      - val_set:   GOOD (da varie posizioni) + FAULT (dalle posizioni val_fault_scope).
 
-    - VAL_GOOD_PER_POS:
-        * int / float globale:
-             v >= 1   -> numero assoluto per ogni posizione nello scope
-             0 < v < 1 -> frazione dei GOOD per ogni posizione nello scope
-        * dict per-posizione:
-             valore <1  -> frazione
-             valore >=1 -> numero assoluto
+    Il numero di GOOD in validation è controllato da val_good_per_pos.
+    Il seed controlla la scelta casuale dei good spostati in validation (=> "test").
+    Il train_seed controlla la scelta casuale del sottoinsieme di GOOD usato per il TRAIN.
 
-    - good_fraction:
-        * float globale: stessa percentuale per tutte le posizioni di train
-        * dict per-posizione: frazione distinta per ogni posizione
+    Compatibilità con il comportamento precedente:
+      - se train_seed è None -> si usa un solo generatore (come prima)
+      - se train_seed == seed -> di nuovo un solo generatore, quindi
+        stessi split di prima a parità di seed.
+      - se train_seed != seed -> generatori diversi per validation e train.
     """
     T = _get_T()
 
+    # Trasformazioni/resize
     if transform is None:
         if img_size is None:
             transform = None
@@ -553,13 +553,19 @@ def build_ad_datasets(
         rgb_policy=rgb_policy
     )
 
-    rng = torch.Generator().manual_seed(seed)
+    # >>> NEW: generatori separati ma compatibili
+    rng_val = torch.Generator().manual_seed(seed)
+    if train_seed is None or train_seed == seed:
+        # comportamento identico al vecchio codice: un solo generatore
+        rng_train = rng_val
+    else:
+        rng_train = torch.Generator().manual_seed(train_seed)
 
     train_keep_by_pos: dict[str, list[Image.Image]] = {}
     val_sel_by_pos:   dict[str, list[Image.Image]] = {}
     per_pos_counts:   dict[str, dict] = {}
 
-    # 1) posizioni del TRAIN: splitto togliendo k per la val
+    # 1) posizioni del TRAIN: splitto togliendo k per la val (usando rng_val)
     for pos in train_pos_list:
         imgs_pos = get_items(part, "rgb", label="good", positions=[pos], return_type="pil",
                              rgb_policy=rgb_policy)
@@ -575,7 +581,7 @@ def build_ad_datasets(
             k = _cap_warn(pos, k, n)
 
         if k > 0:
-            idx = torch.randperm(n, generator=rng).tolist()
+            idx = torch.randperm(n, generator=rng_val).tolist()
             sel  = [imgs_pos[i] for i in idx[:k]]
             keep = [imgs_pos[i] for i in idx[k:]]
         else:
@@ -589,7 +595,7 @@ def build_ad_datasets(
             "good_train": len(keep),
         }
 
-    # 2) posizioni extra per la validation (non in train)
+    # 2) posizioni extra per la validation (non in train), sempre con rng_val
     extra_val_pos = [p for p in val_good_pos if p not in train_pos_list]
     for pos in extra_val_pos:
         imgs_pos = get_items(part, "rgb", label="good", positions=[pos], return_type="pil",
@@ -605,14 +611,14 @@ def build_ad_datasets(
                 k = int(raw)
             k = _cap_warn(pos, k, n)
         if k > 0:
-            idx = torch.randperm(n, generator=rng).tolist()
+            idx = torch.randperm(n, generator=rng_val).tolist()
             sel = [imgs_pos[i] for i in idx[:k]]
         else:
             sel = []
         val_sel_by_pos[pos] = sel
         per_pos_counts[pos] = {"good_total": n, "good_val": len(sel), "good_train": 0}
 
-    # --- sotto-campionamento percentuale del TRAIN per posizione ---
+    # --- sotto-campionamento percentuale del TRAIN per posizione (rng_train) ---
     good_train_remaining: list[Image.Image] = []
 
     for pos, keep in train_keep_by_pos.items():
@@ -623,7 +629,7 @@ def build_ad_datasets(
             n_keep = len(keep)
             n_pick = max(0, int(round(n_keep * frac_pos)))
             if n_pick < n_keep:
-                idx = torch.randperm(n_keep, generator=rng).tolist()
+                idx = torch.randperm(n_keep, generator=rng_train).tolist()
                 picked = [keep[i] for i in idx[:n_pick]]
             else:
                 picked = keep
