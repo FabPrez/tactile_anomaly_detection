@@ -1,4 +1,4 @@
-# padim.py
+# filename: padim.py
 import os, random
 from collections import OrderedDict
 from tqdm import tqdm
@@ -16,6 +16,104 @@ from view_utils import show_dataset_images, show_validation_grid_from_loader
 from sklearn.metrics import roc_curve, roc_auc_score, confusion_matrix
 
 from scipy.ndimage import gaussian_filter
+
+# ============================================================
+# NEW: stampa Recall (x) quando Precision (y) = 0.900 nella PR
+# ============================================================
+def _first_not_none(*vals):
+    for v in vals:
+        if v is not None:
+            return v
+    return None
+
+
+def _find_x_at_y(x: np.ndarray, y: np.ndarray, y0: float):
+    """
+    Trova tutti gli x (interpolati) per cui la curva (x,y) incrocia y=y0.
+    Se non incrocia, restituisce comunque il punto più vicino a y0.
+
+    Ritorna:
+      - xs_cross: lista di x dove y=y0
+      - x_near, y_near: punto più vicino a y0
+    """
+    x = np.asarray(x, dtype=np.float64).ravel()
+    y = np.asarray(y, dtype=np.float64).ravel()
+
+    m = np.isfinite(x) & np.isfinite(y)
+    x, y = x[m], y[m]
+    if x.size < 2:
+        return [], None, None
+
+    diff = y - y0
+    xs_cross = []
+
+    # punti esatti
+    exact_idx = np.where(diff == 0.0)[0]
+    if exact_idx.size > 0:
+        xs_cross.extend([float(x[i]) for i in exact_idx])
+
+    # incroci tra punti consecutivi (cambio di segno)
+    cross_idx = np.where(diff[:-1] * diff[1:] < 0.0)[0]
+    for i in cross_idx:
+        x1, x2 = x[i], x[i + 1]
+        y1, y2 = y[i], y[i + 1]
+        if y2 == y1:
+            continue
+        t = (y0 - y1) / (y2 - y1)
+        xs_cross.append(float(x1 + t * (x2 - x1)))
+
+    # punto più vicino
+    j = int(np.argmin(np.abs(diff)))
+    x_near = float(x[j])
+    y_near = float(y[j])
+
+    # dedup + sort
+    xs_cross = sorted(set([round(v, 12) for v in xs_cross]))
+    return xs_cross, x_near, y_near
+
+
+def print_recall_when_precision_is(results: dict, precision_target: float = 0.900, tag: str = ""):
+    """
+    Assumendo PR con:
+      x = recall
+      y = precision
+    stampa recall @ precision=precision_target (anche più valori se la curva incrocia più volte).
+    """
+    pr = (results.get("curves", {}) or {}).get("pr", {}) or {}
+
+    # prova chiavi più probabili
+    recall = _first_not_none(
+        pr.get("recall", None),
+        pr.get("x", None),
+        pr.get("rec", None),
+    )
+    precision = _first_not_none(
+        pr.get("precision", None),
+        pr.get("y", None),
+        pr.get("prec", None),
+    )
+
+    if recall is None or precision is None:
+        print(
+            f"[PR]{'['+tag+']' if tag else ''} Non trovo gli array della curva PR in results['curves']['pr'] "
+            f"(servono recall/precision oppure x/y). Chiavi disponibili: {list(pr.keys())}"
+        )
+        return
+
+    recall = np.asarray(recall, dtype=np.float64).ravel()
+    precision = np.asarray(precision, dtype=np.float64).ravel()
+
+    xs, x_near, y_near = _find_x_at_y(recall, precision, precision_target)
+
+    if xs:
+        xs_str = ", ".join([f"{v:.6f}" for v in xs])
+        print(f"[PR]{'['+tag+']' if tag else ''} recall @ precision={precision_target:.3f} -> {xs_str}")
+    else:
+        print(
+            f"[PR]{'['+tag+']' if tag else ''} la curva NON incrocia precision={precision_target:.3f}. "
+            f"Punto più vicino: recall={x_near:.6f} con precision={y_near:.6f}"
+        )
+
 
 # ----------------- CONFIG -----------------
 METHOD = "PADIM"
@@ -43,13 +141,12 @@ PIECE_TO_POSITION = {
     "PZ5": "pos1",
 }
 
-
 # PaDiM
-PADIM_D   = 550                  # canali selezionati (<= C_total)
+PADIM_D   = 550
 IMG_SIZE  = 224
 SEED      = 42
 GAUSSIAN_SIGMA = 4
-RIDGE = 0.01                     # stabilizzazione cov
+RIDGE = 0.01
 
 # Visualizzazioni
 VIS_VALID_DATASET = False
@@ -61,8 +158,7 @@ VIS_PREDICTION_ON_VALID_DATASET = True
 def embedding_concat_nn(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     """
     Allineamento PaDiM via nearest-neighbor (replica a blocchi s×s) + concat canali.
-    Equivalente concettualmente a unfold/fold a blocchi, ma senza allocazioni grandi.
-    x: (B, C1, H1, W1), y: (B, C2, H2, W2), con H1/H2 intero.
+    x: (B, C1, H1, W1), y: (B, C2, H2, W2)
     out: (B, C1+C2, H1, W1)
     """
     y_up = F.interpolate(y, size=(x.shape[-2], x.shape[-1]), mode='nearest')
@@ -71,7 +167,7 @@ def embedding_concat_nn(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 class PaDiMTileModel:
     """
-    PaDiM per un singolo tile: salva mean/cov per ogni posizione, predice heatmap Mahalanobis.
+    (Non usato nel main, ma lo lascio intatto se ti serve altrove.)
     """
     def __init__(self, padim_d=550, img_size=224, ridge=0.01, gaussian_sigma=4, device="cpu"):
         self.padim_d = padim_d
@@ -103,36 +199,35 @@ class PaDiMTileModel:
             _ = self.model(img_t)
         l1, l2, l3 = [t.cpu() for t in self.outputs[:3]]
         emb = embedding_concat_nn(l1, l2)
-        emb = embedding_concat_nn(emb, l3)  # (1, Ctot, H, W)
+        emb = embedding_concat_nn(emb, l3)
         C_total = emb.shape[1]
         if self.sel_idx is None:
             d = min(self.padim_d, C_total)
             rng = torch.Generator().manual_seed(1024)
             self.sel_idx = torch.randperm(C_total, generator=rng)[:d].tolist()
-        emb = emb[:, self.sel_idx, :, :]  # (1, d, H, W)
+        emb = emb[:, self.sel_idx, :, :]
         B, d, H, W = emb.shape
         self.H, self.W = H, W
-        return emb.view(B, d, H*W).squeeze(0)  # (d, L)
+        return emb.view(B, d, H*W).squeeze(0)
 
     def fit(self, tiles):
-        # tiles: lista di immagini (H,W,C)
         feats = []
         for tile in tiles:
-            emb = self._extract_embedding(tile)  # (d, L)
+            emb = self._extract_embedding(tile)
             feats.append(emb)
-        X = torch.stack(feats, dim=0)  # (N, d, L)
+        X = torch.stack(feats, dim=0)
         N, d, L = X.shape
-        mean = X.mean(dim=0)  # (d, L)
+        mean = X.mean(dim=0)
         cov = torch.zeros((d, d, L), dtype=torch.float32)
         for l in range(L):
-            diffs = X[:,:,l] - mean[:,l][None,:]  # (N, d)
+            diffs = X[:,:,l] - mean[:,l][None,:]
             cov[:,:,l] = (diffs.t() @ diffs) / max(1, N-1)
             cov[:,:,l] += self.ridge * torch.eye(d)
         self.mean = mean.numpy().astype(np.float32)
         self.cov = cov.numpy().astype(np.float32)
 
     def predict(self, tile):
-        emb = self._extract_embedding(tile)  # (d, L)
+        emb = self._extract_embedding(tile)
         mean = self.mean
         cov = self.cov
         d, L = emb.shape
@@ -140,20 +235,18 @@ class PaDiMTileModel:
         TILE = 256
         for l0 in range(0, L, TILE):
             l1_ = min(l0 + TILE, L)
-            t = l1_ - l0
-            diffs = emb[:, l0:l1_].T - mean[:, l0:l1_].T  # (t, d)
-            cov_t = np.transpose(cov[:, :, l0:l1_], (2, 0, 1)).copy()  # (t, d, d)
+            diffs = emb[:, l0:l1_].T - mean[:, l0:l1_].T
+            cov_t = np.transpose(cov[:, :, l0:l1_], (2, 0, 1)).copy()
             eps = 1e-2
             cov_t += eps * np.eye(d, dtype=np.float32)[None, :, :]
             cov_t_t = torch.from_numpy(cov_t)
             diffs_t = torch.from_numpy(diffs)
             Lfac = torch.linalg.cholesky(cov_t_t)
-            diffsT = diffs_t.transpose(0,1).unsqueeze(2)  # (d, t, 1)
+            diffsT = diffs_t.transpose(0,1).unsqueeze(2)
             sol = torch.cholesky_solve(diffsT, Lfac)
             dist2_t = (diffsT.squeeze(2) * sol.squeeze(2)).sum(dim=0)
             dist2[l0:l1_] = dist2_t.cpu().numpy().astype(np.float32)
         dist_arr = np.sqrt(dist2).reshape(self.H, self.W)
-        # upsample + gaussian
         dist_t = torch.from_numpy(dist_arr).unsqueeze(0).unsqueeze(0)
         score_map = F.interpolate(dist_t, size=self.img_size, mode='bilinear', align_corners=False).squeeze().numpy()
         if self.gaussian_sigma > 0:
@@ -165,7 +258,6 @@ class PaDiMTileModel:
 def main():
     # ======== DATASETS & LOADERS ========
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # device = torch.device("cpu") # force cpu
 
     train_set, val_set, meta = build_ad_datasets(
         part=CODICE_PEZZO,
@@ -204,314 +296,9 @@ def main():
     model.layer3[-1].register_forward_hook(hook)
 
     # ======== TRAINING STREAMING (2 PASS: mean -> cov) ========
-    # Prova a caricare la cache (se esiste salto il train)
     try:
         train_payload = load_split_pickle(CODICE_PEZZO, TRAIN_TAG, split="train", method=METHOD)
         print(f"[cache] PaDiM train payload caricato ({METHOD}).")
-        mean    = train_payload["mean"]          # (d, L)
-        cov     = train_payload["cov"]           # (d, d, L)
-        sel_idx = train_payload["sel_idx"]       # (d,)
-        H, W    = train_payload["shape"]         # feature map size
-        L       = H * W
-    except FileNotFoundError:
-        print("[cache] Nessun pickle train: avvio training streaming (mean -> cov).")
-
-        # --- selezione canali: verrà inizializzata al primo batch ---
-        rng = torch.Generator().manual_seed(1024)
-        sel_idx = None
-        d = None
-        H = W = L = None
-
-        # ---------- PASSO 1: stima MEDIA in streaming ----------
-        N = 0
-        sum_x = None  # torch tensor (d, L)
-
-        with torch.inference_mode():
-            for (x, _, _) in tqdm(train_loader, desc="| pass1 mean |"):
-                _ = model(x.to(device, non_blocking=True))
-                l1, l2, l3 = [t.cpu() for t in outputs[:3]]
-                outputs.clear()
-
-                # allineamento e concat (come tuo reference)
-                emb_b = embedding_concat_nn(l1, l2)
-                emb_b = embedding_concat_nn(emb_b, l3)          # (B, C_total, H, W)
-                del l1, l2, l3
-
-                # inizializza sel_idx al primo batch
-                if sel_idx is None:
-                    C_total = emb_b.shape[1]
-                    d = min(PADIM_D, C_total)
-                    sel_idx = torch.randperm(C_total, generator=rng)[:d].tolist()
-
-                # selezione canali SUBITO (riduce memoria)
-                emb_b = emb_b[:, sel_idx, :, :]               # (B, d, H, W)
-                B = emb_b.shape[0]
-                H, W = emb_b.shape[-2], emb_b.shape[-1]
-                L = H * W
-
-                E = emb_b.view(B, d, L).to(torch.float32)     # (B, d, L)
-
-                if sum_x is None:
-                    sum_x = E.sum(dim=0)                      # (d, L)
-                else:
-                    sum_x += E.sum(dim=0)
-                N += B
-
-                del emb_b, E, x
-                if device.type == "cuda":
-                    torch.cuda.empty_cache()
-
-        mean = (sum_x / float(N)).cpu().numpy().astype(np.float32)  # (d, L)
-        del sum_x
-
-        # ---------- PASSO 2: stima COVARIANZA in streaming + tiling su L ----------
-        cov = np.zeros((d, d, L), dtype=np.float32)
-        RIDGE = 0.01
-        TILE  = 256  # puoi aumentare/diminuire in base alla RAM
-
-        with torch.inference_mode():
-            for (x, _, _) in tqdm(train_loader, desc="| pass2 cov |"):
-                _ = model(x.to(device, non_blocking=True))
-                l1, l2, l3 = [t.cpu() for t in outputs[:3]]
-                outputs.clear()
-
-                emb_b = embedding_concat_nn(l1, l2)
-                emb_b = embedding_concat_nn(emb_b, l3)          # (B, C_total, H, W)
-                emb_b = emb_b[:, sel_idx, :, :]               # (B, d, H, W)
-                B = emb_b.shape[0]
-                E = emb_b.view(B, d, L).numpy().astype(np.float32)   # (B, d, L)
-                del l1, l2, l3, emb_b
-
-                for l0 in range(0, L, TILE):
-                    l1_ = min(l0 + TILE, L)
-                    t = l1_ - l0
-
-                    diffs = E[:, :, l0:l1_] - mean[:, l0:l1_][None, :, :]   # (B, d, t)
-                    # somma degli outer products su B → (d, d, t)
-                    cov[:, :, l0:l1_] += np.einsum('bdt,bkt->dkt', diffs, diffs, optimize=True).astype(np.float32)
-
-                del E, x
-                if device.type == "cuda":
-                    torch.cuda.empty_cache()
-
-        # normalizzazione non-bias e ridge per stabilità numerica
-        cov /= float(max(1, N - 1))
-        cov += (RIDGE * np.eye(d, dtype=np.float32))[:, :, None]  # aggiungi RIDGE a ogni Σ_l
-
-        # ---------- SALVA PICKLE (solo training) ----------
-        train_payload = {
-            "version": 1,
-            "cfg": {
-                "backbone": "wide_resnet50_2",
-                "padim_d": int(d),
-                "ridge": float(RIDGE),
-                "img_size": int(IMG_SIZE),
-                "seed": 1024,
-                "train_tag": TRAIN_TAG,
-            },
-            "mean": mean,                                          # (d, L)
-            "cov":  cov,                                           # (d, d, L)
-            "sel_idx": np.array(sel_idx, dtype=np.int64),          # (d,)
-            "shape": (int(H), int(W)),                             # (H, W)
-        }
-        save_split_pickle(train_payload, CODICE_PEZZO, TRAIN_TAG, split="train", method=METHOD)
-        print(">> Train feature bank salvato su pickle (mean+cov).")
-
-    # --- variabili comode per la validazione ---
-    mean    = train_payload["mean"]
-    cov     = train_payload["cov"]
-    sel_idx = train_payload["sel_idx"]
-    H, W    = train_payload["shape"]
-    L       = H * W
-
-    print(">> Train feature bank ready (from cache or freshly computed).")
-
-    # ======== VALIDATION ========
-    raw_score_maps = []   # heatmap RAW (prima di normalizzazione)
-    img_scores_list = []  # image scores (dopo normalizzazione globale)
-    gt_list, gt_mask_list = [], []
-
-    with torch.inference_mode():
-        for (x, y, m) in tqdm(val_loader, desc="| feature extraction | validation |"):
-            gt_list.extend(y.cpu().numpy())
-            gt_mask_list.extend(m.cpu().numpy())
-
-            _ = model(x.to(device, non_blocking=True))
-            l1, l2, l3 = [t.cpu().detach() for t in outputs[:3]]
-            outputs.clear()
-
-            # concat multi-scala (leggera)
-            emb_t = embedding_concat_nn(l1, l2)
-            emb_t = embedding_concat_nn(emb_t, l3)                # (B, Ctot, H, W)
-
-            # stessa selezione canali del train
-            idx = torch.tensor(train_payload["sel_idx"], dtype=torch.long)
-            Ht, Wt = train_payload["shape"]
-            emb_t = torch.index_select(emb_t, 1, idx)             # (B, d, H, W)
-            Bv, dv, Hc, Wc = emb_t.shape
-            assert (Ht, Wt) == (Hc, Wc)
-
-            # -> NumPy per Mahalanobis (per-pixel) con Cholesky batched + tiling
-            emb_np_v = emb_t.view(Bv, dv, Hc * Wc).numpy().astype(np.float32)     # (B, d, L)
-            mean_v   = train_payload["mean"]                                      # (d, L)
-            cov_v    = train_payload["cov"]                                       # (d, d, L)
-
-            Lloc = Hc * Wc
-            TILE = 256  # prova 512 se hai RAM
-            dist2_LB = np.empty((Lloc, Bv), dtype=np.float32)
-
-            for l0 in range(0, Lloc, TILE):
-                l1_ = min(l0 + TILE, Lloc)
-                t = l1_ - l0
-
-                # diffs: (t, Bv, d)
-                diffs_t = np.transpose(emb_np_v[:, :, l0:l1_], (2, 0, 1)) - mean_v[:, l0:l1_].T[:, None, :]
-
-                # covariances: (t, d, d) + piccola ridge extra per sicurezza
-                cov_t = np.transpose(cov_v[:, :, l0:l1_], (2, 0, 1)).copy()
-                eps = 1e-2
-                cov_t += eps * np.eye(dv, dtype=np.float32)[None, :, :]
-
-                # torch batched cholesky solve
-                cov_t_t = torch.from_numpy(cov_t)            # (t,d,d)
-                diffs_t_t = torch.from_numpy(diffs_t)        # (t,Bv,d)
-
-                Lfac = torch.linalg.cholesky(cov_t_t)        # (t,d,d)
-                diffsT = diffs_t_t.transpose(1, 2).contiguous()  # (t,d,Bv)
-                sol = torch.cholesky_solve(diffsT, Lfac)         # (t,d,Bv)
-
-                dist2_tB = (diffsT * sol).sum(dim=1)             # (t,Bv)
-                dist2_LB[l0:l1_, :] = dist2_tB.cpu().numpy().astype(np.float32)
-
-            # back to (Bv, Hc, Wc)
-            dist_arr = np.sqrt(dist2_LB.T).astype(np.float32).reshape(Bv, Hc, Wc)
-
-            # upsample + gaussian (solo per visual)
-            dist_t  = torch.from_numpy(dist_arr).unsqueeze(1)  # (B,1,H,W)
-            score_b = F.interpolate(dist_t, size=IMG_SIZE, mode='bilinear',
-                                    align_corners=False).squeeze(1).numpy()
-            for i in range(score_b.shape[0]):
-                score_b[i] = gaussian_filter(score_b[i], sigma=GAUSSIAN_SIGMA)
-
-            # accumulo heatmap RAW
-            raw_score_maps.extend([score_b[i] for i in range(score_b.shape[0])])
-
-            # cleanup
-            del l1, l2, l3, emb_t, emb_np_v, dist_t, dist_arr, score_b, x
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
-
-    # ---- normalizzazione SOLO per image score ----
-    raw_score_maps = np.asarray(raw_score_maps, dtype=np.float32)   # (N, H, W)
-    smax, smin = raw_score_maps.max(), raw_score_maps.min()
-    scores_norm = (raw_score_maps - smin) / (smax - smin + 1e-12)   # (N, H, W) solo per image-score
-
-    img_scores_list = scores_norm.reshape(scores_norm.shape[0], -1).max(axis=1)
-    gt_np = np.asarray(gt_list, dtype=np.int32)
-
-    # ROC AUC image-level
-    fpr, tpr, thresholds = roc_curve(gt_np, img_scores_list)
-    auc_img = roc_auc_score(gt_np, img_scores_list)
-    print(f"[image-level] ROC-AUC ({CODICE_PEZZO}/train={TRAIN_TAG}): {auc_img:.3f}")
-
-    # Soglia (Youden) per classificazione image-level
-    J = tpr - fpr
-    best_idx = int(np.argmax(J))
-    best_thr = float(thresholds[best_idx])
-    preds_img = (img_scores_list >= best_thr).astype(np.int32)
-
-    tn, fp, fn, tp = confusion_matrix(gt_np, preds_img, labels=[0, 1]).ravel()
-    print(f"[image-level] soglia (Youden) = {best_thr:.6f}")
-    print(f"[image-level] CM -> TN:{tn}  FP:{fp}  FN:{fn}  TP:{tp}")
-    print(f"[image-level] TPR:{tpr[best_idx]:.3f}  FPR:{fpr[best_idx]:.3f}")
-
-    # Plot ROC
-    fig, ax = plt.subplots(1, 2, figsize=(10, 4))
-    ax[0].plot(fpr, tpr, label=f"AUC={auc_img:.3f}")
-    ax[0].plot([0,1],[0,1],'k--',linewidth=1)
-    ax[0].set_title("Image-level ROC"); ax[0].set_xlabel("FPR"); ax[0].set_ylabel("TPR"); ax[0].legend()
-    plt.tight_layout(); plt.show()
-
-    # Visualizzazione griglia su validation (opzionale)
-    if VIS_PREDICTION_ON_VALID_DATASET:
-        show_validation_grid_from_loader(
-            val_loader, img_scores_list, preds_img,
-            per_page=4, samples_per_row=2,
-            show_mask=True, show_mask_product=True,
-            overlay=True, overlay_alpha=0.45
-        )
-
-    # ======== Valutazione pixel-level (tua utility) ========
-    results = run_pixel_level_evaluation(
-        score_map_list=list(raw_score_maps),    # heatmap RAW
-        val_set=val_set,
-        img_scores=img_scores_list,
-        use_threshold="pro",
-        fpr_limit=0.01,
-        vis=True,
-        vis_ds_or_loader=val_loader.dataset
-    )
-    print_pixel_report(results, title=f"{METHOD} | {CODICE_PEZZO}/train={TRAIN_TAG}")
-
-
-def run_single_experiment():
-    """
-    Esegue un esperimento completo usando le variabili globali:
-        CODICE_PEZZO
-        GOOD_FRACTION
-    Ritorna:
-        (image_auroc, pixel_auroc, pixel_auprc, pixel_aucpro)
-    """
-    # seed
-    random.seed(SEED)
-    np.random.seed(SEED)
-    torch.manual_seed(SEED)
-
-    # ======== DATASETS & LOADERS ========
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    train_set, val_set, meta = build_ad_datasets(
-        part=CODICE_PEZZO,
-        img_size=IMG_SIZE,
-        train_positions=TRAIN_POSITIONS,
-        val_fault_scope=VAL_FAULT_SCOPE,
-        val_good_scope=VAL_GOOD_SCOPE,
-        val_good_per_pos=VAL_GOOD_PER_POS,
-        good_fraction=GOOD_FRACTION,
-        seed=SEED,
-        transform=None,
-    )
-    TRAIN_TAG = meta["train_tag"]
-    # print("[meta]", meta)
-
-    # print(f"Train GOOD (pos {meta['train_positions']}): {meta['counts']['train_good']}")
-    # print(f"Val   GOOD: {meta['counts']['val_good']}")
-    # print(f"Val  FAULT (pos {meta['val_fault_positions']}): {meta['counts']['val_fault']}")
-    # print(f"Val  TOT: {meta['counts']['val_total']}")
-
-    train_loader, val_loader = make_loaders(train_set, val_set, batch_size=32, device=device)
-
-    # ======== MODEL ========
-    weights = Wide_ResNet50_2_Weights.IMAGENET1K_V1
-    model   = wide_resnet50_2(weights=weights).to(device)
-    model.eval()
-
-    # Hook: come nell'originale
-    outputs = []
-    def hook(_m, _in, out): outputs.append(out)
-    model.layer1[-1].register_forward_hook(hook)
-    model.layer2[-1].register_forward_hook(hook)
-    model.layer3[-1].register_forward_hook(hook)
-
-    # ======== TRAINING STREAMING (2 PASS: mean -> cov) ========
-    try:
-        train_payload = load_split_pickle(CODICE_PEZZO, TRAIN_TAG, split="train", method=METHOD)
-        print(f"[cache] PaDiM train payload caricato ({METHOD}).")
-        mean    = train_payload["mean"]          # (d, L)
-        cov     = train_payload["cov"]           # (d, d, L)
-        sel_idx = train_payload["sel_idx"]       # (d,)
-        H, W    = train_payload["shape"]         # feature map size
-        L       = H * W
     except FileNotFoundError:
         print("[cache] Nessun pickle train: avvio training streaming (mean -> cov).")
 
@@ -520,7 +307,7 @@ def run_single_experiment():
         d = None
         H = W = L = None
 
-        # ---------- PASSO 1: stima MEDIA ----------
+        # ---------- PASSO 1: MEDIA ----------
         N = 0
         sum_x = None  # (d, L)
 
@@ -531,7 +318,7 @@ def run_single_experiment():
                 outputs.clear()
 
                 emb_b = embedding_concat_nn(l1, l2)
-                emb_b = embedding_concat_nn(emb_b, l3)          # (B, C_total, H, W)
+                emb_b = embedding_concat_nn(emb_b, l3)
                 del l1, l2, l3
 
                 if sel_idx is None:
@@ -539,15 +326,15 @@ def run_single_experiment():
                     d = min(PADIM_D, C_total)
                     sel_idx = torch.randperm(C_total, generator=rng)[:d].tolist()
 
-                emb_b = emb_b[:, sel_idx, :, :]                # (B, d, H, W)
+                emb_b = emb_b[:, sel_idx, :, :]
                 B = emb_b.shape[0]
                 H, W = emb_b.shape[-2], emb_b.shape[-1]
                 L = H * W
 
-                E = emb_b.view(B, d, L).to(torch.float32)      # (B, d, L)
+                E = emb_b.view(B, d, L).to(torch.float32)
 
                 if sum_x is None:
-                    sum_x = E.sum(dim=0)                       # (d, L)
+                    sum_x = E.sum(dim=0)
                 else:
                     sum_x += E.sum(dim=0)
                 N += B
@@ -556,10 +343,10 @@ def run_single_experiment():
                 if device.type == "cuda":
                     torch.cuda.empty_cache()
 
-        mean = (sum_x / float(N)).cpu().numpy().astype(np.float32)  # (d, L)
+        mean = (sum_x / float(N)).cpu().numpy().astype(np.float32)
         del sum_x
 
-        # ---------- PASSO 2: stima COVARIANZA ----------
+        # ---------- PASSO 2: COV ----------
         cov = np.zeros((d, d, L), dtype=np.float32)
         RIDGE_LOCAL = RIDGE
         TILE  = 256
@@ -571,17 +358,15 @@ def run_single_experiment():
                 outputs.clear()
 
                 emb_b = embedding_concat_nn(l1, l2)
-                emb_b = embedding_concat_nn(emb_b, l3)          # (B, C_total, H, W)
-                emb_b = emb_b[:, sel_idx, :, :]                # (B, d, H, W)
+                emb_b = embedding_concat_nn(emb_b, l3)
+                emb_b = emb_b[:, sel_idx, :, :]
                 B = emb_b.shape[0]
-                E = emb_b.view(B, d, L).numpy().astype(np.float32)   # (B, d, L)
+                E = emb_b.view(B, d, L).numpy().astype(np.float32)
                 del l1, l2, l3, emb_b
 
                 for l0 in range(0, L, TILE):
                     l1_ = min(l0 + TILE, L)
-                    t = l1_ - l0
-
-                    diffs = E[:, :, l0:l1_] - mean[:, l0:l1_][None, :, :]   # (B, d, t)
+                    diffs = E[:, :, l0:l1_] - mean[:, l0:l1_][None, :, :]
                     cov[:, :, l0:l1_] += np.einsum('bdt,bkt->dkt', diffs, diffs, optimize=True).astype(np.float32)
 
                 del E, x
@@ -606,10 +391,10 @@ def run_single_experiment():
             "sel_idx": np.array(sel_idx, dtype=np.int64),
             "shape": (int(H), int(W)),
         }
-        # save_split_pickle(train_payload, CODICE_PEZZO, TRAIN_TAG, split="train", method=METHOD)
-        # print(">> Train feature bank salvato su pickle (mean+cov).")
+        save_split_pickle(train_payload, CODICE_PEZZO, TRAIN_TAG, split="train", method=METHOD)
+        print(">> Train feature bank salvato su pickle (mean+cov).")
 
-    # variabili comode
+    # --- variabili comode ---
     mean    = train_payload["mean"]
     cov     = train_payload["cov"]
     sel_idx = train_payload["sel_idx"]
@@ -633,17 +418,17 @@ def run_single_experiment():
             outputs.clear()
 
             emb_t = embedding_concat_nn(l1, l2)
-            emb_t = embedding_concat_nn(emb_t, l3)                # (B, Ctot, H, W)
+            emb_t = embedding_concat_nn(emb_t, l3)
 
             idx = torch.tensor(train_payload["sel_idx"], dtype=torch.long)
             Ht, Wt = train_payload["shape"]
-            emb_t = torch.index_select(emb_t, 1, idx)             # (B, d, H, W)
+            emb_t = torch.index_select(emb_t, 1, idx)
             Bv, dv, Hc, Wc = emb_t.shape
             assert (Ht, Wt) == (Hc, Wc)
 
-            emb_np_v = emb_t.view(Bv, dv, Hc * Wc).numpy().astype(np.float32)     # (B, d, L)
-            mean_v   = train_payload["mean"]                                      # (d, L)
-            cov_v    = train_payload["cov"]                                       # (d, d, L)
+            emb_np_v = emb_t.view(Bv, dv, Hc * Wc).numpy().astype(np.float32)
+            mean_v   = train_payload["mean"]
+            cov_v    = train_payload["cov"]
 
             Lloc = Hc * Wc
             TILE = 256
@@ -653,26 +438,25 @@ def run_single_experiment():
                 l1_ = min(l0 + TILE, Lloc)
                 t = l1_ - l0
 
-                diffs_t = np.transpose(emb_np_v[:, :, l0:l1_], (2, 0, 1)) - mean_v[:, l0:l1_].T[:, None, :]  # (t,Bv,d)
-                cov_t = np.transpose(cov_v[:, :, l0:l1_], (2, 0, 1)).copy()  # (t,d,d)
+                diffs_t = np.transpose(emb_np_v[:, :, l0:l1_], (2, 0, 1)) - mean_v[:, l0:l1_].T[:, None, :]
+                cov_t = np.transpose(cov_v[:, :, l0:l1_], (2, 0, 1)).copy()
                 eps = 1e-2
                 cov_t += eps * np.eye(dv, dtype=np.float32)[None, :, :]
 
-                cov_t_t = torch.from_numpy(cov_t)            # (t,d,d)
-                diffs_t_t = torch.from_numpy(diffs_t)        # (t,Bv,d)
+                cov_t_t = torch.from_numpy(cov_t)
+                diffs_t_t = torch.from_numpy(diffs_t)
 
                 Lfac = torch.linalg.cholesky(cov_t_t)
-                diffsT = diffs_t_t.transpose(1, 2).contiguous()  # (t,d,Bv)
-                sol = torch.cholesky_solve(diffsT, Lfac)         # (t,d,Bv)
-                dist2_tB = (diffsT * sol).sum(dim=1)             # (t,Bv)
+                diffsT = diffs_t_t.transpose(1, 2).contiguous()
+                sol = torch.cholesky_solve(diffsT, Lfac)
 
+                dist2_tB = (diffsT * sol).sum(dim=1)
                 dist2_LB[l0:l1_, :] = dist2_tB.cpu().numpy().astype(np.float32)
 
             dist_arr = np.sqrt(dist2_LB.T).astype(np.float32).reshape(Bv, Hc, Wc)
 
-            dist_t  = torch.from_numpy(dist_arr).unsqueeze(1)  # (B,1,H,W)
-            score_b = F.interpolate(dist_t, size=IMG_SIZE, mode='bilinear',
-                                    align_corners=False).squeeze(1).numpy()
+            dist_t  = torch.from_numpy(dist_arr).unsqueeze(1)
+            score_b = F.interpolate(dist_t, size=IMG_SIZE, mode='bilinear', align_corners=False).squeeze(1).numpy()
             for i in range(score_b.shape[0]):
                 score_b[i] = gaussian_filter(score_b[i], sigma=GAUSSIAN_SIGMA)
 
@@ -682,8 +466,260 @@ def run_single_experiment():
             if device.type == "cuda":
                 torch.cuda.empty_cache()
 
-    # normalizzazione per image-score
-    raw_score_maps = np.asarray(raw_score_maps, dtype=np.float32)   # (N, H, W)
+    # ---- normalizzazione SOLO per image score ----
+    raw_score_maps = np.asarray(raw_score_maps, dtype=np.float32)
+    smax, smin = raw_score_maps.max(), raw_score_maps.min()
+    scores_norm = (raw_score_maps - smin) / (smax - smin + 1e-12)
+
+    img_scores_list = scores_norm.reshape(scores_norm.shape[0], -1).max(axis=1)
+    gt_np = np.asarray(gt_list, dtype=np.int32)
+
+    # ROC AUC image-level
+    fpr, tpr, thresholds = roc_curve(gt_np, img_scores_list)
+    auc_img = roc_auc_score(gt_np, img_scores_list)
+    print(f"[image-level] ROC-AUC ({CODICE_PEZZO}/train={TRAIN_TAG}): {auc_img:.3f}")
+
+    # Soglia (Youden)
+    J = tpr - fpr
+    best_idx = int(np.argmax(J))
+    best_thr = float(thresholds[best_idx])
+    preds_img = (img_scores_list >= best_thr).astype(np.int32)
+
+    tn, fp, fn, tp = confusion_matrix(gt_np, preds_img, labels=[0, 1]).ravel()
+    print(f"[image-level] soglia (Youden) = {best_thr:.6f}")
+    print(f"[image-level] CM -> TN:{tn}  FP:{fp}  FN:{fn}  TP:{tp}")
+    print(f"[image-level] TPR:{tpr[best_idx]:.3f}  FPR:{fpr[best_idx]:.3f}")
+
+    # Plot ROC
+    fig, ax = plt.subplots(1, 2, figsize=(10, 4))
+    ax[0].plot(fpr, tpr, label=f"AUC={auc_img:.3f}")
+    ax[0].plot([0,1],[0,1],'k--',linewidth=1)
+    ax[0].set_title("Image-level ROC"); ax[0].set_xlabel("FPR"); ax[0].set_ylabel("TPR"); ax[0].legend()
+    plt.tight_layout(); plt.show()
+
+    if VIS_PREDICTION_ON_VALID_DATASET:
+        show_validation_grid_from_loader(
+            val_loader, img_scores_list, preds_img,
+            per_page=4, samples_per_row=2,
+            show_mask=True, show_mask_product=True,
+            overlay=True, overlay_alpha=0.45
+        )
+
+    # ======== PIXEL-LEVEL ========
+    results = run_pixel_level_evaluation(
+        score_map_list=list(raw_score_maps),    # heatmap RAW
+        val_set=val_set,
+        img_scores=img_scores_list,
+        use_threshold="pro",
+        fpr_limit=0.01,
+        vis=True,
+        vis_ds_or_loader=val_loader.dataset
+    )
+
+    # >>> NEW: stampa recall quando precision=0.900 (curva PR)
+    print_recall_when_precision_is(results, precision_target=0.900, tag=f"{METHOD}|{CODICE_PEZZO}|{TRAIN_TAG}")
+
+    print_pixel_report(results, title=f"{METHOD} | {CODICE_PEZZO}/train={TRAIN_TAG}")
+
+
+def run_single_experiment():
+    """
+    Esegue un esperimento completo usando le variabili globali:
+        CODICE_PEZZO
+        GOOD_FRACTION
+    Ritorna:
+        (image_auroc, pixel_auroc, pixel_auprc, pixel_aucpro)
+    """
+    random.seed(SEED)
+    np.random.seed(SEED)
+    torch.manual_seed(SEED)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    train_set, val_set, meta = build_ad_datasets(
+        part=CODICE_PEZZO,
+        img_size=IMG_SIZE,
+        train_positions=TRAIN_POSITIONS,
+        val_fault_scope=VAL_FAULT_SCOPE,
+        val_good_scope=VAL_GOOD_SCOPE,
+        val_good_per_pos=VAL_GOOD_PER_POS,
+        good_fraction=GOOD_FRACTION,
+        seed=SEED,
+        transform=None,
+    )
+    TRAIN_TAG = meta["train_tag"]
+
+    train_loader, val_loader = make_loaders(train_set, val_set, batch_size=32, device=device)
+
+    weights = Wide_ResNet50_2_Weights.IMAGENET1K_V1
+    model   = wide_resnet50_2(weights=weights).to(device)
+    model.eval()
+
+    outputs = []
+    def hook(_m, _in, out): outputs.append(out)
+    model.layer1[-1].register_forward_hook(hook)
+    model.layer2[-1].register_forward_hook(hook)
+    model.layer3[-1].register_forward_hook(hook)
+
+    # ======== TRAINING STREAMING (2 PASS: mean -> cov) ========
+    try:
+        train_payload = load_split_pickle(CODICE_PEZZO, TRAIN_TAG, split="train", method=METHOD)
+        # print(f"[cache] PaDiM train payload caricato ({METHOD}).")
+    except FileNotFoundError:
+        # print("[cache] Nessun pickle train: avvio training streaming (mean -> cov).")
+        rng = torch.Generator().manual_seed(1024)
+        sel_idx = None
+        d = None
+        H = W = L = None
+
+        # ---------- PASSO 1: MEDIA ----------
+        N = 0
+        sum_x = None
+
+        with torch.inference_mode():
+            for (x, _, _) in tqdm(train_loader, desc="| pass1 mean |"):
+                _ = model(x.to(device, non_blocking=True))
+                l1, l2, l3 = [t.cpu() for t in outputs[:3]]
+                outputs.clear()
+
+                emb_b = embedding_concat_nn(l1, l2)
+                emb_b = embedding_concat_nn(emb_b, l3)
+                del l1, l2, l3
+
+                if sel_idx is None:
+                    C_total = emb_b.shape[1]
+                    d = min(PADIM_D, C_total)
+                    sel_idx = torch.randperm(C_total, generator=rng)[:d].tolist()
+
+                emb_b = emb_b[:, sel_idx, :, :]
+                B = emb_b.shape[0]
+                H, W = emb_b.shape[-2], emb_b.shape[-1]
+                L = H * W
+
+                E = emb_b.view(B, d, L).to(torch.float32)
+
+                if sum_x is None:
+                    sum_x = E.sum(dim=0)
+                else:
+                    sum_x += E.sum(dim=0)
+                N += B
+
+                del emb_b, E, x
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+
+        mean = (sum_x / float(N)).cpu().numpy().astype(np.float32)
+        del sum_x
+
+        # ---------- PASSO 2: COV ----------
+        cov = np.zeros((d, d, L), dtype=np.float32)
+        RIDGE_LOCAL = RIDGE
+        TILE  = 256
+
+        with torch.inference_mode():
+            for (x, _, _) in tqdm(train_loader, desc="| pass2 cov |"):
+                _ = model(x.to(device, non_blocking=True))
+                l1, l2, l3 = [t.cpu() for t in outputs[:3]]
+                outputs.clear()
+
+                emb_b = embedding_concat_nn(l1, l2)
+                emb_b = embedding_concat_nn(emb_b, l3)
+                emb_b = emb_b[:, sel_idx, :, :]
+                B = emb_b.shape[0]
+                E = emb_b.view(B, d, L).numpy().astype(np.float32)
+                del l1, l2, l3, emb_b
+
+                for l0 in range(0, L, TILE):
+                    l1_ = min(l0 + TILE, L)
+                    diffs = E[:, :, l0:l1_] - mean[:, l0:l1_][None, :, :]
+                    cov[:, :, l0:l1_] += np.einsum('bdt,bkt->dkt', diffs, diffs, optimize=True).astype(np.float32)
+
+                del E, x
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+
+        cov /= float(max(1, N - 1))
+        cov += (RIDGE_LOCAL * np.eye(d, dtype=np.float32))[:, :, None]
+
+        train_payload = {
+            "version": 1,
+            "cfg": {
+                "backbone": "wide_resnet50_2",
+                "padim_d": int(d),
+                "ridge": float(RIDGE_LOCAL),
+                "img_size": int(IMG_SIZE),
+                "seed": 1024,
+                "train_tag": TRAIN_TAG,
+            },
+            "mean": mean,
+            "cov":  cov,
+            "sel_idx": np.array(sel_idx, dtype=np.int64),
+            "shape": (int(H), int(W)),
+        }
+        # (nel batch non salvo su pickle per non sporcare cache se non vuoi)
+        # save_split_pickle(train_payload, CODICE_PEZZO, TRAIN_TAG, split="train", method=METHOD)
+
+    # ======== VALIDATION ========
+    raw_score_maps = []
+    gt_list = []
+
+    with torch.inference_mode():
+        for (x, y, m) in tqdm(val_loader, desc="| feature extraction | validation |"):
+            gt_list.extend(y.cpu().numpy())
+
+            _ = model(x.to(device, non_blocking=True))
+            l1, l2, l3 = [t.cpu().detach() for t in outputs[:3]]
+            outputs.clear()
+
+            emb_t = embedding_concat_nn(l1, l2)
+            emb_t = embedding_concat_nn(emb_t, l3)
+
+            idx = torch.tensor(train_payload["sel_idx"], dtype=torch.long)
+            Ht, Wt = train_payload["shape"]
+            emb_t = torch.index_select(emb_t, 1, idx)
+            Bv, dv, Hc, Wc = emb_t.shape
+            assert (Ht, Wt) == (Hc, Wc)
+
+            emb_np_v = emb_t.view(Bv, dv, Hc * Wc).numpy().astype(np.float32)
+            mean_v   = train_payload["mean"]
+            cov_v    = train_payload["cov"]
+
+            Lloc = Hc * Wc
+            TILE = 256
+            dist2_LB = np.empty((Lloc, Bv), dtype=np.float32)
+
+            for l0 in range(0, Lloc, TILE):
+                l1_ = min(l0 + TILE, Lloc)
+
+                diffs_t = np.transpose(emb_np_v[:, :, l0:l1_], (2, 0, 1)) - mean_v[:, l0:l1_].T[:, None, :]
+                cov_t = np.transpose(cov_v[:, :, l0:l1_], (2, 0, 1)).copy()
+                eps = 1e-2
+                cov_t += eps * np.eye(dv, dtype=np.float32)[None, :, :]
+
+                cov_t_t = torch.from_numpy(cov_t)
+                diffs_t_t = torch.from_numpy(diffs_t)
+
+                Lfac = torch.linalg.cholesky(cov_t_t)
+                diffsT = diffs_t_t.transpose(1, 2).contiguous()
+                sol = torch.cholesky_solve(diffsT, Lfac)
+
+                dist2_tB = (diffsT * sol).sum(dim=1)
+                dist2_LB[l0:l1_, :] = dist2_tB.cpu().numpy().astype(np.float32)
+
+            dist_arr = np.sqrt(dist2_LB.T).astype(np.float32).reshape(Bv, Hc, Wc)
+
+            dist_t  = torch.from_numpy(dist_arr).unsqueeze(1)
+            score_b = F.interpolate(dist_t, size=IMG_SIZE, mode='bilinear', align_corners=False).squeeze(1).numpy()
+            for i in range(score_b.shape[0]):
+                score_b[i] = gaussian_filter(score_b[i], sigma=GAUSSIAN_SIGMA)
+
+            raw_score_maps.extend([score_b[i] for i in range(score_b.shape[0])])
+
+            del l1, l2, l3, emb_t, emb_np_v, dist_t, dist_arr, score_b, x
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
+    raw_score_maps = np.asarray(raw_score_maps, dtype=np.float32)
     smax, smin = raw_score_maps.max(), raw_score_maps.min()
     scores_norm = (raw_score_maps - smin) / (smax - smin + 1e-12)
 
@@ -700,10 +736,10 @@ def run_single_experiment():
     preds_img = (img_scores_list >= best_thr).astype(np.int32)
 
     tn, fp, fn, tp = confusion_matrix(gt_np, preds_img, labels=[0, 1]).ravel()
-    
+
     # ==== PIXEL-LEVEL ====
     results = run_pixel_level_evaluation(
-        score_map_list=list(raw_score_maps),    # heatmap RAW
+        score_map_list=list(raw_score_maps),
         val_set=val_set,
         img_scores=img_scores_list,
         use_threshold="pro",
@@ -712,10 +748,13 @@ def run_single_experiment():
         vis_ds_or_loader=None
     )
 
+    # >>> NEW: stampa recall quando precision=0.900 (curva PR)
+    print_recall_when_precision_is(results, precision_target=0.900, tag=f"{METHOD}|{CODICE_PEZZO}|gf={GOOD_FRACTION}")
+
     pixel_auroc   = float(results["curves"]["roc"]["auc"])
     pixel_auprc   = float(results["curves"]["pr"]["auprc"])
     pixel_auc_pro = float(results["curves"]["pro"]["auc"])
-    
+
     print(f"[image-level] ROC-AUC ({CODICE_PEZZO}/train={TRAIN_TAG}, good_frac={GOOD_FRACTION}): {auc_img:.3f}")
     print(f"[image-level] soglia (Youden) = {best_thr:.6f}")
     print(f"[image-level] CM -> TN:{tn}  FP:{fp}  FN:{fn}  TP:{tp}")
@@ -727,10 +766,6 @@ def run_single_experiment():
 
 
 def run_all_fractions_for_current_piece():
-    """
-    Esegue più esperimenti variando GOOD_FRACTION per il pezzo corrente (CODICE_PEZZO).
-    Usa solo variabili GLOBALI.
-    """
     global GOOD_FRACTION
 
     good_fracs = [
@@ -747,7 +782,6 @@ def run_all_fractions_for_current_piece():
 
     for gf in good_fracs:
         GOOD_FRACTION = gf
-        
         print(f"\n=== PaDiM | PEZZO {CODICE_PEZZO}, FRAZIONE GOOD = {GOOD_FRACTION} ===")
         auc_img, px_auroc, px_auprc, px_aucpro = run_single_experiment()
 
@@ -770,18 +804,12 @@ def run_all_fractions_for_current_piece():
         "pixel_auprc": pxpr_list,
         "pixel_auc_pro": pxpro_list,
     }
+
+
 def run_all_pieces_and_fractions():
-    """
-    Esegue TUTTI i pezzi e TUTTE le frazioni.
-    Usa variabili GLOBALI sovrascritte ogni volta:
-      - CODICE_PEZZO
-      - TRAIN_POSITIONS, VAL_GOOD_SCOPE, VAL_FAULT_SCOPE
-    """
     global CODICE_PEZZO, TRAIN_POSITIONS, VAL_GOOD_SCOPE, VAL_FAULT_SCOPE
 
-    # scegli qui i pezzi che vuoi far girare
     pieces = ["PZ1", "PZ2", "PZ3", "PZ4", "PZ5"]
-
     all_results = {}
 
     for pezzo in pieces:
@@ -791,7 +819,6 @@ def run_all_pieces_and_fractions():
             raise ValueError(f"Nessuna posizione definita in PIECE_TO_POSITION per il pezzo {pezzo}")
 
         pos = PIECE_TO_POSITION[pezzo]
-
         TRAIN_POSITIONS = [pos]
         VAL_GOOD_SCOPE  = [pos]
         VAL_FAULT_SCOPE = [pos]

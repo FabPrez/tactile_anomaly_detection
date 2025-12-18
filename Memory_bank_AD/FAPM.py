@@ -30,6 +30,104 @@ try:
 except Exception:
     HAS_SCIPY = False
 
+
+# ============================================================
+# NEW: stampa Recall (x) quando Precision (y) = 0.900 nella PR
+# ============================================================
+def _first_not_none(*vals):
+    for v in vals:
+        if v is not None:
+            return v
+    return None
+
+
+def _find_x_at_y(x: np.ndarray, y: np.ndarray, y0: float):
+    """
+    Trova tutti gli x (interpolati) per cui la curva (x,y) incrocia y=y0.
+    Se non incrocia, restituisce comunque il punto più vicino a y0.
+    Ritorna:
+      - xs_cross: lista di x dove y=y0
+      - x_near, y_near: punto più vicino a y0
+    """
+    x = np.asarray(x, dtype=np.float64).ravel()
+    y = np.asarray(y, dtype=np.float64).ravel()
+
+    m = np.isfinite(x) & np.isfinite(y)
+    x, y = x[m], y[m]
+    if x.size < 2:
+        return [], None, None
+
+    diff = y - y0
+    xs_cross = []
+
+    # punti esatti
+    exact_idx = np.where(diff == 0.0)[0]
+    if exact_idx.size > 0:
+        xs_cross.extend([float(x[i]) for i in exact_idx])
+
+    # incroci tra punti consecutivi (cambio di segno)
+    cross_idx = np.where(diff[:-1] * diff[1:] < 0.0)[0]
+    for i in cross_idx:
+        x1, x2 = x[i], x[i + 1]
+        y1, y2 = y[i], y[i + 1]
+        if y2 == y1:
+            continue
+        t = (y0 - y1) / (y2 - y1)
+        xs_cross.append(float(x1 + t * (x2 - x1)))
+
+    # punto più vicino
+    j = int(np.argmin(np.abs(diff)))
+    x_near = float(x[j])
+    y_near = float(y[j])
+
+    # dedup + sort
+    xs_cross = sorted(set([round(v, 12) for v in xs_cross]))
+    return xs_cross, x_near, y_near
+
+
+def print_recall_when_precision_is(results: dict, precision_target: float = 0.900, tag: str = ""):
+    """
+    Assumendo PR con:
+      x = recall
+      y = precision
+    stampa recall @ precision=precision_target (anche più valori se la curva incrocia più volte).
+    """
+    pr = (results.get("curves", {}) or {}).get("pr", {}) or {}
+
+    # prova chiavi più probabili
+    recall = _first_not_none(
+        pr.get("recall", None),
+        pr.get("x", None),
+        pr.get("rec", None),
+    )
+    precision = _first_not_none(
+        pr.get("precision", None),
+        pr.get("y", None),
+        pr.get("prec", None),
+    )
+
+    if recall is None or precision is None:
+        print(
+            f"[PR]{'['+tag+']' if tag else ''} Non trovo gli array della curva PR in results['curves']['pr'] "
+            f"(servono recall/precision oppure x/y). Chiavi disponibili: {list(pr.keys())}"
+        )
+        return
+
+    recall = np.asarray(recall, dtype=np.float64).ravel()
+    precision = np.asarray(precision, dtype=np.float64).ravel()
+
+    xs, x_near, y_near = _find_x_at_y(recall, precision, precision_target)
+
+    if xs:
+        xs_str = ", ".join([f"{v:.6f}" for v in xs])
+        print(f"[PR]{'['+tag+']' if tag else ''} recall @ precision={precision_target:.3f} -> {xs_str}")
+    else:
+        print(
+            f"[PR]{'['+tag+']' if tag else ''} la curva NON incrocia precision={precision_target:.3f}. "
+            f"Punto più vicino: recall={x_near:.6f} con precision={y_near:.6f}"
+        )
+
+
 # ---------------- CONFIG ----------------
 METHOD               = "FAPM"     # nome metodo per salvataggio pickle (cartelle tue utility)
 CODICE_PEZZO         = "PZ3"
@@ -381,26 +479,24 @@ def inference_single_image(
     # 6) somma fine+coarse → score_patch totale (49,16,k)
     score_patch = score_patch_f + score_patch_c_up
 
-    # 7) anomaly map a 28x28 (repo: rearrange '(h1 h) (w1 w) v -> (h1 w1 h w) v' con h1=7,w1=4)
-    #    Prima ricaviamo solo il primo NN per la mappa (indice 0)
+    # 7) anomaly map a 28x28 (repo: rearrange)
     amap_49x16 = score_patch[:, :, 0]  # (49,16)
-    # mapping a 28x28:
-    #   input (49,16) = (h1*h, w1*w) con h1=7,h=7, w1=4,w=4  ->  (h1*w1, h*w) = (28,28)
-    # costruiamo via view/permute per evitare dipendenze einops
-    # Prima rimappiamo (49 -> 7x7) e (16 -> 4x4)
     amap = amap_49x16.view(7, 7, 4, 4).permute(0, 2, 1, 3).contiguous().view(28, 28)  # (28,28)
 
-    # 8) image-level score (repo):
-    #    score_patches: (49*16, k) = (28*28, k)
+    # 8) image-level score (repo)
     score_patches = score_patch.view(49 * 16, K_NN)  # (784, k)
-    # w = 1 - (max(softmax(N_b)) )
     Nb = score_patches[torch.argmax(score_patches[:, 0])]  # (k,)
     w = 1.0 - (torch.exp(Nb).max() / torch.exp(Nb).sum())
     image_score = float(w.item() * score_patches[:, 0].max().item())
 
     # 9) resize a IMG_SIZE e blur
-    amap_res = F.interpolate(amap.unsqueeze(0).unsqueeze(0), size=IMG_SIZE,
-                             mode="bilinear", align_corners=False).squeeze().cpu().numpy().astype(np.float32)
+    amap_res = F.interpolate(
+        amap.unsqueeze(0).unsqueeze(0),
+        size=IMG_SIZE,
+        mode="bilinear",
+        align_corners=False
+    ).squeeze().cpu().numpy().astype(np.float32)
+
     if GAUSSIAN_SIGMA > 0 and HAS_SCIPY:
         amap_res = gaussian_filter(amap_res, sigma=GAUSSIAN_SIGMA)
 
@@ -532,7 +628,7 @@ def main():
     print(f"[image-level] CM -> TN:{tn}  FP:{fp}  FN:{fn}  TP:{tp}")
     print(f"[image-level] TPR:{tpr[best_idx]:.3f}  FPR:{fpr[best_idx]:.3f}")
 
-    # Curva ROC 
+    # Curva ROC
     fig, ax = plt.subplots(1, 2, figsize=(10, 4))
     ax[0].plot(fpr, tpr, label=f"AUC={auc_img:.3f}")
     ax[0].plot([0, 1], [0, 1], 'k--', linewidth=1)
@@ -556,6 +652,10 @@ def main():
         vis=True,
         vis_ds_or_loader=val_loader.dataset
     )
+
+    # >>> NEW: stampa recall quando precision=0.900 (curva PR)
+    print_recall_when_precision_is(results, precision_target=0.900, tag=f"{METHOD}|{CODICE_PEZZO}|{TRAIN_TAG}")
+
     print_pixel_report(results, title=f"{METHOD} | {CODICE_PEZZO}/train={TRAIN_TAG}")
 
 
@@ -590,11 +690,6 @@ def run_single_experiment():
         debug_print_val_paths=False,   # <<< accendi la stampa
     )
     TRAIN_TAG = meta["train_tag"]
-    # print("[meta]", meta)
-    # print(f"Train GOOD (pos {meta['train_positions']}): {meta['counts']['train_good']}")
-    # print(f"Val   GOOD: {meta['counts']['val_good']}")
-    # print(f"Val  FAULT (pos {meta['val_fault_positions']}): {meta['counts']['val_fault']}")
-    # print(f"Val  TOT: {meta['counts']['val_total']}")
 
     # loaders (stessa logica del main)
     train_loader, _ = make_loaders(train_set, val_set, batch_size=max(8, BATCH_TEST), device=device)
@@ -642,22 +737,24 @@ def run_single_experiment():
     preds = (img_scores >= best_thr).astype(np.int32)
     tn, fp, fn, tp = confusion_matrix(gt_img, preds, labels=[0, 1]).ravel()
 
-    # ======= PIXEL-LEVEL (no visual per velocità) =======
+    # ======= PIXEL-LEVEL =======
     results = run_pixel_level_evaluation(
         score_map_list=list(out["raw_score_maps"]),
         val_set=val_set,
         img_scores=out["img_scores"],
         use_threshold="pro",
         fpr_limit=0.01,
-        vis=False,
+        vis=True,
         vis_ds_or_loader=None
     )
+
+    # >>> NEW: stampa recall quando precision=0.900 (curva PR)
+    print_recall_when_precision_is(results, precision_target=0.900, tag=f"{METHOD}|{CODICE_PEZZO}|gf={GOOD_FRACTION}")
 
     pixel_auroc   = float(results["curves"]["roc"]["auc"])
     pixel_auprc   = float(results["curves"]["pr"]["auprc"])
     pixel_auc_pro = float(results["curves"]["pro"]["auc"])
-    
-    
+
     print(f"[image-level] ROC-AUC ({CODICE_PEZZO}/train={TRAIN_TAG}, good_frac={GOOD_FRACTION}): {auc_img:.3f}")
     print(f"[image-level] soglia (Youden) = {best_thr:.6f}")
     print(f"[image-level] CM -> TN:{tn}  FP:{fp}  FN:{fn}  TP:{tp}")
@@ -724,9 +821,8 @@ def run_all_pieces_and_fractions():
     global CODICE_PEZZO, TRAIN_POSITIONS, VAL_GOOD_SCOPE, VAL_FAULT_SCOPE
 
     # scegli qui i pezzi che vuoi far girare
-    pieces = ["PZ1", "PZ2", "PZ3", "PZ4", "PZ5"]
-    # pieces = ["PZ4", "PZ5"]
-    
+    # pieces = ["PZ1", "PZ2", "PZ3", "PZ4", "PZ5"]
+    pieces = ["PZ4"]
 
     all_results = {}
 
