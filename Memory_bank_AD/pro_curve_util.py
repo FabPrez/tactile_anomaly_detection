@@ -25,7 +25,7 @@ def compute_pro(anomaly_maps, ground_truth_maps):
         pros: numpy array of corresponding PRO values.
     """
 
-    print("Compute PRO curve...")
+    # print("Compute PRO curve...")
 
     # Structuring element for computing connected components.
     structure = np.ones((3, 3), dtype=int)
@@ -80,7 +80,7 @@ def compute_pro(anomaly_maps, ground_truth_maps):
     pro_changes_flat = pro_changes.ravel()
 
     # Sort all anomaly scores.
-    print(f"Sort {len(anomaly_scores_flat)} anomaly scores...")
+    # print(f"Sort {len(anomaly_scores_flat)} anomaly scores...")
     sort_idxs = np.argsort(anomaly_scores_flat).astype(np.uint32)[::-1]
 
     # Info: np.take(a, ind, out=a) followed by b=a instead of

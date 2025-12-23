@@ -3,6 +3,8 @@
 
 import os
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"  # determinismo CUDA
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="torchvision")
 
 import math, random, time
 from typing import List, Dict, Tuple, Optional
@@ -148,7 +150,8 @@ PIECE_TO_POSITION = {
 }
 
 IMG_SIZE  = 224
-SEED      = 42
+TEST_SEED  = 42  # controlla *solo* la scelta delle immagini di validation/test
+TRAIN_SEED = 9  # lo puoi cambiare tu per variare
 
 # InReaCh (repo)
 ASSOC_DEPTH        = 10
@@ -394,11 +397,11 @@ class Feautre_Descriptor(abc.ABC):
             image = np.expand_dims(image, axis=0)
         return torch.tensor(image, dtype=torch.float32)
 
-    def generate_descriptors(self, images: List[np.ndarray], quite: bool = False):
+    def generate_descriptors(self, images: List[np.ndarray], quite: bool = True):
         device = next(self.model.parameters()).device
         with torch.no_grad():
             output = []
-            for _, image in enumerate(tqdm(images, ncols=100, desc='Gen Feature Descriptors', disable=quite)):
+            for _, image in enumerate(tqdm(images, ncols=100, desc='Gen Feature Descriptors', disable=True)):
                 x = self.image_net_norm(image).to(device)
                 feats_dict = self.model(x)
                 features_list = [feats_dict[layer] for layer in feats_dict.keys()]  # in ordine
@@ -485,7 +488,7 @@ class InReaCh:
                  filter_size: float = 5,
                  **kwargs) -> None:
 
-        self.quite = quite
+        self.quite = False
         self.images = images
         self.masks = masks
         self.image_size = tuple(images[0].shape)
@@ -503,8 +506,8 @@ class InReaCh:
             align=False,
             quite=self.quite
         )
-        print("**** aligment_flag: ", self.aligment_flag)
-        print("**** pos_embed_flag: ", self.pos_embed_flag)
+        # print("**** aligment_flag: ", self.aligment_flag)
+        # print("**** pos_embed_flag: ", self.pos_embed_flag)
 
         self.pos_embed_weight = float(pos_embed_weight) if self.pos_embed_flag else 0.0
 
@@ -615,7 +618,7 @@ class InReaCh:
         assoc = np.ones((self.assoc_depth, self.patches.size(0), self.patches.size(2), 5), dtype=np.float32) * np.inf
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         for seed_index in tq.tqdm(range(min(self.assoc_depth, self.patches.size(0))), ncols=100,
-                                  desc='Associate To Channels', disable=quite):
+                                  desc='Associate To Channels', disable=True):
             gpu_seeds = self.patches[seed_index].to(device)
             for compare_index in range(seed_index + 1, self.patches.size(0)):
                 assoc[seed_index, compare_index] = self.gen_assoc(
@@ -632,7 +635,7 @@ class InReaCh:
         assoc_flat = np.resize(assoc_best, (assoc_best.shape[0] * assoc_best.shape[1], assoc_best.shape[2]))
 
         channels: Dict[str, List] = {}
-        for p_index in tq.tqdm(range(assoc_flat.shape[0]), ncols=100, desc='Create Channels', disable=quite):
+        for p_index in tq.tqdm(range(assoc_flat.shape[0]), ncols=100, desc='Create Channels', disable=True):
             if assoc_flat[p_index, 0] < np.inf:
                 channel_name = f"{int(assoc_flat[p_index, 0])}_{int(assoc_flat[p_index, 3])}"
                 if channel_name in channels:
@@ -654,7 +657,7 @@ class InReaCh:
                     ])
 
         nominal_points = []
-        for channel_name in tq.tqdm(list(channels.keys()), ncols=100, desc='Filter Channels', disable=quite):
+        for channel_name in tq.tqdm(list(channels.keys()), ncols=100, desc='Filter Channels', disable=True):
             if len(channels[channel_name]) > self.min_channel_length:
                 c_patches = np.array([patch[0] for patch in channels[channel_name]], dtype=np.float32)
                 mean = np.mean(c_patches, axis=0, dtype=np.float32)
@@ -697,7 +700,7 @@ class InReaCh:
         t_patches = self.fd_gen.generate_descriptors(t_images_aligned, quite=quite)  # [N, D, L]
 
         scores = []
-        for test_img_index in tq.tqdm(range(t_patches.size(0)), ncols=100, desc='Predicting On Images', disable=quite):
+        for test_img_index in tq.tqdm(range(t_patches.size(0)), ncols=100, desc='Predicting On Images', disable=True):
             q = torch.permute(t_patches[test_img_index], (1, 0)).contiguous().cpu().numpy().astype(np.float32)  # (L, D)
             dist, ind = self.nn_object.search(q, KNN_K)
             dist = dist[:, 0]
@@ -707,8 +710,8 @@ class InReaCh:
             dist_up = dist2d.repeat(rep, axis=0).repeat(rep, axis=1)
             scores.append(gaussian_filter(dist_up, self.filter_size))
 
-        if not quite:
-            print('TIME TO COMPLETE all predictions', abs(start - time.time()))
+        # if not quite:
+            # print('TIME TO COMPLETE all predictions', abs(start - time.time()))
 
         return scores, t_masks_aligned, t_images_aligned
 
@@ -795,8 +798,10 @@ def main():
         val_good_scope=VAL_GOOD_SCOPE,
         val_good_per_pos=VAL_GOOD_PER_POS,
         good_fraction=GOOD_FRACTION,
-        seed=SEED,
+        seed=TEST_SEED,
+        train_seed=TRAIN_SEED,
         transform=None,
+        debug_print_val_paths=False,   # <<< accendi la stampa
     )
     TRAIN_TAG = meta["train_tag"]
     print("[meta]", meta)
@@ -917,7 +922,7 @@ def run_single_experiment():
     Ritorna:
         (image_auroc, pixel_auroc, pixel_auprc, pixel_aucpro)
     """
-    super_seed(SEED)
+    super_seed(TRAIN_SEED)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     train_set, val_set, meta = build_ad_datasets(
@@ -928,8 +933,10 @@ def run_single_experiment():
         val_good_scope=VAL_GOOD_SCOPE,
         val_good_per_pos=VAL_GOOD_PER_POS,
         good_fraction=GOOD_FRACTION,
-        seed=SEED,
+        seed=TEST_SEED,
+        train_seed=TRAIN_SEED,
         transform=None,
+        debug_print_val_paths=False,   # <<< accendi la stampa
     )
     TRAIN_TAG = meta["train_tag"]
     train_loader, val_loader = make_loaders(train_set, val_set, batch_size=32, device=device)
@@ -1013,7 +1020,7 @@ def run_single_experiment():
 def run_all_fractions_for_current_piece():
     global GOOD_FRACTION
 
-    good_fracs = [round(x/100, 3) for x in range(5, 25, 5)]
+    good_fracs = [round(x/100, 3) for x in range(5, 101, 5)]
     # good_fracs = [0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.7, 1.0]
 
     img_list = []
@@ -1031,12 +1038,12 @@ def run_all_fractions_for_current_piece():
         pxpr_list.append(px_auprc)
         pxpro_list.append(px_aucpro)
 
-    print("\n### RISULTATI PER PEZZO", CODICE_PEZZO)
-    print("good_fractions      =", good_fracs)
-    print("image_level_AUROC   =", img_list)
-    print("pixel_level_AUROC   =", pxroc_list)
-    print("pixel_level_AUPRC   =", pxpr_list)
-    print("pixel_level_AUC_PRO =", pxpro_list)
+    # print("\n### RISULTATI PER PEZZO", CODICE_PEZZO)
+    # print("good_fractions      =", good_fracs)
+    # print("image_level_AUROC   =", img_list)
+    # print("pixel_level_AUROC   =", pxroc_list)
+    # print("pixel_level_AUPRC   =", pxpr_list)
+    # print("pixel_level_AUC_PRO =", pxpro_list)
 
     return {
         "good_fractions": good_fracs,
@@ -1050,8 +1057,8 @@ def run_all_fractions_for_current_piece():
 def run_all_pieces_and_fractions():
     global CODICE_PEZZO, TRAIN_POSITIONS, VAL_GOOD_SCOPE, VAL_FAULT_SCOPE
 
-    # pieces = ["PZ1", "PZ2", "PZ3", "PZ4", "PZ5"]
-    pieces = ["PZ2"]
+    pieces = ["PZ1", "PZ2", "PZ3", "PZ4", "PZ5"]
+    # pieces = ["PZ2"]
 
     all_results = {}
 
