@@ -159,7 +159,7 @@ RIDGE = 0.01                     # stabilizzazione cov
 
 # seed separati
 TEST_SEED  = 42   # controlla SOLO la scelta validation/test
-TRAIN_SEED = 3   # controlla SOLO la scelta del sottoinsieme GOOD nel training
+TRAIN_SEED = 1  # controlla SOLO la scelta del sottoinsieme GOOD nel training
 
 # sweep seed (come fai poi nei grafici seed0..seed9)
 TRAIN_SEEDS_TO_RUN = list(range(10))   # [0..9]
