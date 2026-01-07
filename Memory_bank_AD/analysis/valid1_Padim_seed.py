@@ -1846,6 +1846,89 @@ colors_pieces = {
     "PZ5": "purple",
 }
 
+def _as_curves(values, method_name, piece_name, good_fractions):
+    arr = np.array(values, dtype=float)
+    if arr.ndim == 1:
+        curves = arr.reshape(1, -1)
+    elif arr.ndim == 2:
+        curves = arr
+    else:
+        raise ValueError(f"{method_name} – {piece_name}: values ndim={arr.ndim}, atteso 1D o 2D.")
+
+    if curves.shape[1] != len(good_fractions):
+        raise ValueError(
+            f"{method_name} – {piece_name}: colonne={curves.shape[1]} ma len(good_fractions)={len(good_fractions)}"
+        )
+    return curves  # (num_seeds, num_gf)
+
+def plot_metric_all_pieces(method_name, pieces_dict, good_fractions, ylabel, title):
+    
+    plt.figure(figsize=(8, 5))
+
+    for piece_name, values in pieces_dict.items():
+        color = colors_pieces.get(piece_name, None)
+        curves = _as_curves(values, method_name, piece_name, good_fractions)
+        num_seeds, _ = curves.shape
+
+        # scatter di tutti i seed
+        for j, gf in enumerate(good_fractions):
+            plt.scatter(
+                np.full(num_seeds, gf),
+                curves[:, j],
+                alpha=0.4,
+                s=20,
+                color=color
+            )
+
+        # curva media
+        mean_y = curves.mean(axis=0)
+        plt.plot(
+            good_fractions,
+            mean_y,
+            marker="o",
+            linewidth=2,
+            label=f"{piece_name} (media)",
+            color=color
+        )
+
+    plt.title(title)
+    plt.xlabel("Good Fraction")
+    plt.ylabel(ylabel)
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+
+    # LEGENDA FUORI A DESTRA (così non copre i grafici)
+    #plt.legend(loc="center left", bbox_to_anchor=(1.02, 0.5))
+    #plt.tight_layout(rect=[0, 0, 0.82, 1])  # lascia spazio alla legenda
+
+    plt.show()
+
+plot_metric_all_pieces(
+    "PADIM",
+    results_pro_by_method_norm["PADIM"],
+    good_fractions,
+    ylabel="Pixel AUC-PRO",
+    title="PADIM: Pixel-level AUC-PRO vs Good Fraction"
+)
+
+plot_metric_all_pieces(
+    "PADIM",
+    results_pr_by_method_norm["PADIM"],
+    good_fractions,
+    ylabel="Pixel AUPRC (PR)",
+    title="PADIM: Pixel-level AUPRC (PR) vs Good Fraction"
+)
+
+plot_metric_all_pieces(
+    "PADIM",
+    results_roc_by_method_norm["PADIM"],
+    good_fractions,
+    ylabel="Pixel AUROC (ROC)",
+    title="PADIM: Pixel-level AUROC (ROC) vs Good Fraction"
+)
+
+
 # =================================================
 # FUNZIONE: ROC – Pixel-level AUROC
 # GRAFICO SINGOLO PER CIASCUN PEZZO
@@ -2076,17 +2159,14 @@ def plot_method_pr(method_name, pieces_dict):
         plt.show()
 
 
+
 # =================================================
-# LANCIA PER SPADE
+# LANCIA PER PADIM
 # =================================================
 
 plot_method_pro("PADIM", results_pro_by_method_norm["PADIM"])
 plot_method_pr("PADIM",  results_pr_by_method_norm["PADIM"])
 plot_method_roc("PADIM", results_roc_by_method_norm["PADIM"])
-
-
-
-
 
 
 
