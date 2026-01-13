@@ -32,7 +32,7 @@ except Exception:
 
 
 # ============================================================
-# NEW: stampa Recall (x) quando Precision (y) = 0.900 nella PR
+# stampa Recall (x) quando Precision (y) = 0.900 nella PR
 # ============================================================
 def _first_not_none(*vals):
     for v in vals:
@@ -85,7 +85,7 @@ def _find_x_at_y(x: np.ndarray, y: np.ndarray, y0: float):
     return xs_cross, x_near, y_near
 
 
-def print_recall_when_precision_is(results: dict, precision_target: float = 0.900, tag: str = ""):
+def print_recall_when_precision_is(results: dict, precision_target: float = 0.850, tag: str = ""):
     """
     Assumendo PR con:
       x = recall
@@ -132,11 +132,19 @@ def print_recall_when_precision_is(results: dict, precision_target: float = 0.90
 METHOD               = "FAPM"     # nome metodo per salvataggio pickle (cartelle tue utility)
 CODICE_PEZZO         = "PZ3"
 
-TRAIN_POSITIONS      = ["pos1"]
-VAL_GOOD_PER_POS     = 20
-VAL_GOOD_SCOPE       = ["pos1"]
-VAL_FAULT_SCOPE      = ["pos1"]
-GOOD_FRACTION        = 1.0  #0.2 #0.3 #0.5 #0.7  #1.0
+TRAIN_POSITIONS      = ["pos1", "pos2"]  # posizioni usate per il TRAINING
+VAL_GOOD_PER_POS     = {
+    "pos1":20,
+    "pos2": 20
+    
+}
+VAL_GOOD_SCOPE       = ["pos1","pos2"]
+VAL_FAULT_SCOPE      = ["pos1","pos2"]
+GOOD_FRACTION        = {
+    "pos1": 0.6,
+    # "pos2": 0.05
+    
+}
 
 PIECE_TO_POSITION = {
     "PZ1": "pos1",
@@ -744,12 +752,12 @@ def run_single_experiment():
         img_scores=out["img_scores"],
         use_threshold="pro",
         fpr_limit=0.01,
-        vis=True,
+        vis=False,
         vis_ds_or_loader=None
     )
 
-    # >>> NEW: stampa recall quando precision=0.900 (curva PR)
-    print_recall_when_precision_is(results, precision_target=0.900, tag=f"{METHOD}|{CODICE_PEZZO}|gf={GOOD_FRACTION}")
+    #  stampa recall quando precision=0.850 (curva PR)
+    print_recall_when_precision_is(results, precision_target=0.850, tag=f"{METHOD}|{CODICE_PEZZO}|gf={GOOD_FRACTION}")
 
     pixel_auroc   = float(results["curves"]["roc"]["auc"])
     pixel_auprc   = float(results["curves"]["pr"]["auprc"])
@@ -822,7 +830,7 @@ def run_all_pieces_and_fractions():
 
     # scegli qui i pezzi che vuoi far girare
     # pieces = ["PZ1", "PZ2", "PZ3", "PZ4", "PZ5"]
-    pieces = ["PZ4"]
+    pieces = ["PZ3"]
 
     all_results = {}
 
@@ -863,10 +871,10 @@ def run_all_pieces_and_fractions():
 
 if __name__ == "__main__":
     # 1) SOLO 1 ESPERIMENTO (usa le globali in testa)
-    # main()
+     main()
 
     # 2) TUTTE LE FRAZIONI PER UN SOLO PEZZO (CODICE_PEZZO globale)
     # run_all_fractions_for_current_piece()
 
     # 3) TUTTI I PEZZI × TUTTE LE FRAZIONI
-    run_all_pieces_and_fractions()
+    #run_all_pieces_and_fractions()

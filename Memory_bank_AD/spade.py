@@ -31,29 +31,132 @@ from data_loader import save_split_pickle, load_split_pickle, build_ad_datasets,
 from view_utils import show_dataset_images, show_validation_grid_from_loader, show_heatmaps_from_loader
 from ad_analysis import run_pixel_level_evaluation, print_pixel_report
 
+
+# ============================================================
+# stampa Recall (x) quando Precision (y) = 0.900 nella PR
+# 
+# ============================================================
+def _first_not_none(*vals):
+    for v in vals:
+        if v is not None:
+            return v
+    return None
+
+
+def _find_x_at_y(x: np.ndarray, y: np.ndarray, y0: float):
+    """
+    Trova tutti gli x (interpolati) per cui la curva (x,y) incrocia y=y0.
+    Se non incrocia, restituisce comunque il punto più vicino a y0.
+    Ritorna:
+      - xs_cross: lista di x dove y=y0
+      - x_near, y_near: punto più vicino a y0
+    """
+    x = np.asarray(x, dtype=np.float64).ravel()
+    y = np.asarray(y, dtype=np.float64).ravel()
+
+    m = np.isfinite(x) & np.isfinite(y)
+    x, y = x[m], y[m]
+    if x.size < 2:
+        return [], None, None
+
+    diff = y - y0
+    xs_cross = []
+
+    # punti esatti
+    exact_idx = np.where(diff == 0.0)[0]
+    if exact_idx.size > 0:
+        xs_cross.extend([float(x[i]) for i in exact_idx])
+
+    # incroci tra punti consecutivi (cambio di segno)
+    cross_idx = np.where(diff[:-1] * diff[1:] < 0.0)[0]
+    for i in cross_idx:
+        x1, x2 = x[i], x[i + 1]
+        y1, y2 = y[i], y[i + 1]
+        if y2 == y1:
+            continue
+        t = (y0 - y1) / (y2 - y1)
+        xs_cross.append(float(x1 + t * (x2 - x1)))
+
+    # punto più vicino
+    j = int(np.argmin(np.abs(diff)))
+    x_near = float(x[j])
+    y_near = float(y[j])
+
+    # dedup + sort
+    xs_cross = sorted(set([round(v, 12) for v in xs_cross]))
+    return xs_cross, x_near, y_near
+
+
+def print_recall_when_precision_is(results: dict, precision_target: float = 0.900, tag: str = ""):
+    """
+    Assumendo PR con:
+      x = recall
+      y = precision
+    stampa recall @ precision=precision_target (anche più valori se la curva incrocia più volte).
+    """
+    pr = (results.get("curves", {}) or {}).get("pr", {}) or {}
+
+    # prova chiavi più probabili
+    recall = _first_not_none(
+        pr.get("recall", None),
+        pr.get("x", None),
+        pr.get("rec", None),
+    )
+    precision = _first_not_none(
+        pr.get("precision", None),
+        pr.get("y", None),
+        pr.get("prec", None),
+    )
+
+    if recall is None or precision is None:
+        print(
+            f"[PR]{'['+tag+']' if tag else ''} Non trovo gli array della curva PR in results['curves']['pr'] "
+            f"(servono recall/precision oppure x/y). Chiavi disponibili: {list(pr.keys())}"
+        )
+        return
+
+    recall = np.asarray(recall, dtype=np.float64).ravel()
+    precision = np.asarray(precision, dtype=np.float64).ravel()
+
+    xs, x_near, y_near = _find_x_at_y(recall, precision, precision_target)
+
+    if xs:
+        xs_str = ", ".join([f"{v:.6f}" for v in xs])
+        print(f"[PR]{'['+tag+']' if tag else ''} recall @ precision={precision_target:.3f} -> {xs_str}")
+    else:
+        print(
+            f"[PR]{'['+tag+']' if tag else ''} la curva NON incrocia precision={precision_target:.3f}. "
+            f"Punto più vicino: recall={x_near:.6f} con precision={y_near:.6f}"
+        )
+
+
 # ----------------- CONFIG -----------------
 METHOD = "SPADE"
-CODICE_PEZZO = "PZ3"
+CODICE_PEZZO = "PZ1"
 
 # Posizioni "good" usate per il TRAIN (feature bank).
-TRAIN_POSITIONS = ["pos1"]
+TRAIN_POSITIONS = ["pos1","pos2","pos3","pos4"]
 
 # Quanti GOOD per posizione spostare nella VALIDATION (e quindi togliere dal TRAIN).
 # Può essere:
 #   - int  -> numero assoluto per ogni pos nello scope
 #   - float fra 0 e 1 -> percentuale dei GOOD di quella pos
 #   - dict, es: {"pos1": 10, "pos2": 0.2} (10 img per pos1, 20% per pos2)
-VAL_GOOD_PER_POS = 20
+VAL_GOOD_PER_POS = {
+    "pos1":20,
+    "pos2": 20
+    
+}
 
 # Da quali posizioni prelevare i GOOD per la VALIDATION:
 #   "from_train"     -> solo dalle pos di TRAIN_POSITIONS
 #   "all_positions"  -> da tutte le pos del pezzo
 #   ["pos1","pos3"]  -> lista custom
-VAL_GOOD_SCOPE = ["pos1"]
+VAL_GOOD_SCOPE = ["pos1","pos2"]
 
 # Da quali posizioni prendere le FAULT per la VALIDATION:
 #   "train_only" | "all" | lista custom (es. ["pos1","pos2"])
-VAL_FAULT_SCOPE = ["pos1"]
+VAL_FAULT_SCOPE = ["pos1","pos2"]
 
 # Percentuale di GOOD (rimasti dopo aver tolto quelli per la val) da usare nel TRAIN.
 # Può essere:
@@ -63,16 +166,18 @@ VAL_FAULT_SCOPE = ["pos1"]
 #     (20% dei good di pos1, 5% dei good di pos2 dopo la rimozione per la val;
 #      le pos non presenti nel dict usano 1.0 di default).
 GOOD_FRACTION = {
-    "pos1": 0.2,   # 20% pos1
+    "pos1": 0.5,
+    # "pos2": 0.05
+    
 }
 
 # Mappa pezzo → posizione (una sola per pezzo, come in InReaCh)
 PIECE_TO_POSITION = {
-    "PZ1": "pos1",
-    "PZ2": "pos5",
-    "PZ3": "pos1",
-    "PZ4": "pos1",
-    "PZ5": "pos1",
+    "PZ1": "pos1,pos2,pos3,pos4",
+    #"PZ2": "pos5",
+    #"PZ3": "pos",
+    #"PZ4": "pos1",
+    #"PZ5": "pos1",
 }
 
 # Modello / dati
@@ -81,7 +186,7 @@ IMG_SIZE = 224
 
 # >>> NEW: seed separati
 TEST_SEED  = 42  # controlla *solo* la scelta delle immagini di validation/test
-TRAIN_SEED = 2  # lo puoi cambiare tu per variare il sottoinsieme di GOOD usati per il training
+TRAIN_SEED = 42  # lo puoi cambiare tu per variare il sottoinsieme di GOOD usati per il training
 
 # Visualizzazioni
 VIS_VALID_DATASET = False
@@ -351,6 +456,10 @@ def main():
         vis=True,
         vis_ds_or_loader=val_loader.dataset
     )
+
+    # >>> NEW: stampa recall quando precision=0.900 (curva PR)
+    print_recall_when_precision_is(results, precision_target=0.900, tag=f"{METHOD}|{CODICE_PEZZO}|{TRAIN_TAG}")
+
     print_pixel_report(results, title=f"{METHOD} | {CODICE_PEZZO}/train={TRAIN_TAG}")
 
 
@@ -377,8 +486,6 @@ def run_single_experiment():
         debug_print_val_paths=False,   # <<< accendi la stampa
     )
     TRAIN_TAG = meta["train_tag"]
-    # print(meta["val_good_files"])   # dict: posizione -> lista di filename GOOD in validation
-    # print(meta["val_fault_files"])  # lista di filename FAULT in validation (o None)    
 
     if VIS_VALID_DATASET:
         show_dataset_images(val_set, batch_size=5, show_mask=True)
@@ -469,7 +576,8 @@ def run_single_experiment():
             val_loader, img_scores, preds,
             per_page=4, samples_per_row=2,
             show_mask=True, show_mask_product=True,
-            overlay=True, overlay_alpha=0.45
+            overlay=True,
+            overlay_alpha=0.45
         )
 
     # ---- PIXEL LEVEL FEATURES ----
@@ -517,6 +625,10 @@ def run_single_experiment():
         vis=False,
         vis_ds_or_loader=None
     )
+
+    # >>> NEW: stampa recall quando precision=0.900 (curva PR)
+    # tag più “sweep-friendly”: includo gf corrente
+    print_recall_when_precision_is(results, precision_target=0.900, tag=f"{METHOD}|{CODICE_PEZZO}|gf={GOOD_FRACTION}")
 
     print_pixel_report(results, title=f"{METHOD} | {CODICE_PEZZO}/train={TRAIN_TAG}")
 
@@ -594,11 +706,9 @@ def run_all_pieces_and_fractions():
     """
     global CODICE_PEZZO, TRAIN_POSITIONS, VAL_GOOD_SCOPE, VAL_FAULT_SCOPE, GOOD_FRACTION
 
-    pieces = ["PZ1", "PZ2", "PZ3", "PZ4", "PZ5"]
+    # pieces = ["PZ1", "PZ2", "PZ3", "PZ4", "PZ5"]
     # pieces = ["PZ2", "PZ3", "PZ4", "PZ5"]
-    # pieces = ["PZ5"]
-    
-    
+    pieces = ["PZ1"]
 
     all_results = {}
 
@@ -643,7 +753,7 @@ def entry_main():
     Puoi usare questo invece di main() se vuoi solo le sweep.
     """
     # ESEGUI UN SOLO ESPERIMENTO (usa le globali correnti)
-    # run_single_experiment()
+    run_single_experiment()
 
     # TUTTE LE FRAZIONI PER UN SOLO PEZZO
     # CODICE_PEZZO = "PZ3"
@@ -654,7 +764,7 @@ def entry_main():
     # run_all_fractions_for_current_piece()
 
     # TUTTI I PEZZI × TUTTE LE FRAZIONI
-    run_all_pieces_and_fractions()
+    # run_all_pieces_and_fractions()
 
 
 if __name__ == "__main__":

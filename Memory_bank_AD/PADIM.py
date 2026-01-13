@@ -117,20 +117,27 @@ def print_recall_when_precision_is(results: dict, precision_target: float = 0.90
 
 # ----------------- CONFIG -----------------
 METHOD = "PADIM"
-CODICE_PEZZO = "PZ1"
+CODICE_PEZZO = "PZ3"
 
 # Posizioni "good" per il TRAIN (feature bank)
 TRAIN_POSITIONS = ["pos1"]
 
 # Quanti GOOD per posizione spostare in VALIDATION (ed escludere dal TRAIN)
-VAL_GOOD_PER_POS = 0
+VAL_GOOD_PER_POS = {
+    "pos1":20,
+    "pos2": 20
+    
+}
 
 # Da quali posizioni prendere GOOD e FAULT per la VALIDATION
-VAL_GOOD_SCOPE  = ["pos1"]     # "from_train" | "all_positions" | lista
-VAL_FAULT_SCOPE = ["pos1"]     # "train_only" | "all" | lista
-
+VAL_GOOD_SCOPE  = ["pos1","pos2"]     # "from_train" | "all_positions" | lista
+VAL_FAULT_SCOPE = ["pos1","pos2"]     # "train_only" | "all" | lista
 # Percentuale di GOOD (dopo il taglio per la val) da usare nel TRAIN
-GOOD_FRACTION = 0.2
+GOOD_FRACTION = {
+    "pos1": 0.6,
+    # "pos2": 0.05
+    
+}
 
 # Mappa pezzo → posizione da usare (stile InReaCh/FAPM)
 PIECE_TO_POSITION = {
@@ -150,7 +157,7 @@ RIDGE = 0.01
 
 # Visualizzazioni
 VIS_VALID_DATASET = False
-VIS_PREDICTION_ON_VALID_DATASET = True
+VIS_PREDICTION_ON_VALID_DATASET = False
 # ------------------------------------------
 
 
@@ -809,7 +816,7 @@ def run_all_fractions_for_current_piece():
 def run_all_pieces_and_fractions():
     global CODICE_PEZZO, TRAIN_POSITIONS, VAL_GOOD_SCOPE, VAL_FAULT_SCOPE
 
-    pieces = ["PZ1", "PZ2", "PZ3", "PZ4", "PZ5"]
+    pieces = ["PZ3"]
     all_results = {}
 
     for pezzo in pieces:
