@@ -1511,13 +1511,20 @@ results_pr_by_method = {
             ],
             # ----- SEED 9 -----
             [
-                0.9069786956997861, 0.9759697823522777, 0.9840636356319835, 
-                0.9852635135128325, 0.9863573378674598, 0.9873243069954871, 
-                0.9874395816083129, 0.987501852890365, 0.9872674208956492, 
-                0.9872424712516578, 0.9874461661230532, 0.98733760446889, 
-                0.9874803680407737, 0.9875593478390307, 0.9875363011695754, 
-                0.9872937937251751, 0.9871377721537182, 0.9877107261682969, 
-                0.9874095400082716, 0.9875825515079445
+                #0.9069786956997861, 0.9759697823522777, 0.9840636356319835, 
+                #0.9852635135128325, 0.9863573378674598, 0.9873243069954871, 
+                #0.9874395816083129, 0.987501852890365, 0.9872674208956492, 
+                #0.9872424712516578, 0.9874461661230532, 0.98733760446889, 
+                #0.9874803680407737, 0.9875593478390307, 0.9875363011695754, 
+                #0.9872937937251751, 0.9871377721537182, 0.9877107261682969, 
+                #0.9874095400082716, 0.9875825515079445
+                0.042861205655809524, 0.19921402531640578, 0.21096486751637472, 
+                0.21913135260989852, 0.2211954147440842, 0.2176731123811963, 
+                0.2192386581719501, 0.21821331774289798, 0.21894411932421487, 
+                0.2180287761626918, 0.2173089800490829, 0.21718324423229057, 
+                0.21697320929483666, 0.2173683165682625, 0.2166633880204698, 
+                0.21760384655118192, 0.21582356380441875, 0.217172193323647, 
+                0.21733729265433582, 0.21590769231777296
             ],
         ],
 
@@ -1692,6 +1699,7 @@ else:
     results_pr_by_method_norm,  pr_piece_minmax  = results_pr_by_method,  {}
 
 
+
 # Colori per i pezzi
 colors_pieces = {
     "PZ1": "blue",
@@ -1700,6 +1708,91 @@ colors_pieces = {
     "PZ4": "red",
     "PZ5": "purple",
 }
+
+
+def _as_curves(values, method_name, piece_name, good_fractions):
+    arr = np.array(values, dtype=float)
+    if arr.ndim == 1:
+        curves = arr.reshape(1, -1)
+    elif arr.ndim == 2:
+        curves = arr
+    else:
+        raise ValueError(f"{method_name} – {piece_name}: values ndim={arr.ndim}, atteso 1D o 2D.")
+
+    if curves.shape[1] != len(good_fractions):
+        raise ValueError(
+            f"{method_name} – {piece_name}: colonne={curves.shape[1]} ma len(good_fractions)={len(good_fractions)}"
+        )
+    return curves  # (num_seeds, num_gf)
+
+def plot_metric_all_pieces(method_name, pieces_dict, good_fractions, ylabel, title):
+    
+    plt.figure(figsize=(8, 5))
+
+    for piece_name, values in pieces_dict.items():
+        color = colors_pieces.get(piece_name, None)
+        curves = _as_curves(values, method_name, piece_name, good_fractions)
+        num_seeds, _ = curves.shape
+
+        # scatter di tutti i seed
+        for j, gf in enumerate(good_fractions):
+            plt.scatter(
+                np.full(num_seeds, gf),
+                curves[:, j],
+                alpha=0.4,
+                s=20,
+                color=color
+            )
+
+        # curva media
+        mean_y = curves.mean(axis=0)
+        plt.plot(
+            good_fractions,
+            mean_y,
+            marker="o",
+            linewidth=2,
+            label=f"{piece_name} (media)",
+            color=color
+        )
+
+    plt.title(title)
+    plt.xlabel("Good Fraction")
+    plt.ylabel(ylabel)
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+
+    # LEGENDA FUORI A DESTRA (così non copre i grafici)
+    #plt.legend(loc="center left", bbox_to_anchor=(1.02, 0.5))
+    #plt.tight_layout(rect=[0, 0, 0.82, 1])  # lascia spazio alla legenda
+
+    plt.show()
+
+plot_metric_all_pieces(
+    "INREACH",
+    results_pro_by_method_norm["INREACH"],
+    good_fractions,
+    ylabel="Pixel AUC-PRO",
+    title="INREACH: Pixel-level AUC-PRO vs Good Fraction"
+)
+
+plot_metric_all_pieces(
+    "INREACH",
+    results_pr_by_method_norm["INREACH"],
+    good_fractions,
+    ylabel="Pixel AUPRC (PR)",
+    title="INREACH: Pixel-level AUPRC (PR) vs Good Fraction"
+)
+
+plot_metric_all_pieces(
+    "INREACH",
+    results_roc_by_method_norm["INREACH"],
+    good_fractions,
+    ylabel="Pixel AUROC (ROC)",
+    title="INREACH: Pixel-level AUROC (ROC) vs Good Fraction"
+)
+
+
 
 # =================================================
 # FUNZIONE: ROC – Pixel-level AUROC
@@ -1930,131 +2023,7 @@ def plot_method_pr(method_name, pieces_dict):
         plt.tight_layout()
         plt.show()
 
-def _stack_seeds(seed_lists, n_points):
-    out = np.full((len(seed_lists), n_points), np.nan, dtype=float)
-    for i, lst in enumerate(seed_lists):
-        arr = np.asarray(lst, dtype=float).ravel()
-        m = min(len(arr), n_points)
-        out[i, :m] = arr[:m]
-    return out
 
-def plot_all_pieces_single_index(
-    results_by_method: dict,
-    good_fractions: np.ndarray,
-    method: str,
-    index_label: str,
-    title: str = None,
-    band: str = "std",                 # "std" oppure "minmax" oppure None
-    normalize_per_piece: bool = True, # se True: min-max per pezzo su (seed x punti)
-    plot_seeds: bool = True,           # <<< NEW
-    seed_alpha: float = 0.10,          # trasparenza seed
-    seed_lw: float = 0.8,              # spessore seed
-    mean_lw: float = 2.2,              # spessore media
-    colors: dict = None,
-    savepath: str = None
-):
-    if colors is None:
-        colors = {}
-
-    pieces_dict = results_by_method[method]
-    pieces = sorted(pieces_dict.keys())
-
-    x = np.asarray(good_fractions, dtype=float)
-    n_points = len(x)
-
-    plt.figure()
-
-    for pz in pieces:
-        seed_lists = pieces_dict[pz]
-        Y = _stack_seeds(seed_lists, n_points)  # (S, n_points)
-
-        # --- normalizzazione coerente per pezzo (stesso mn/mx per TUTTI i seed) ---
-        if normalize_per_piece:
-            mn = np.nanmin(Y)
-            mx = np.nanmax(Y)
-            if np.isnan(mn) or np.isnan(mx) or np.isclose(mx, mn):
-                Y_norm = np.zeros_like(Y)
-                scale = 1.0
-            else:
-                scale = (mx - mn)
-                Y_norm = (Y - mn) / scale
-            Y_use = Y_norm
-        else:
-            Y_use = Y
-            scale = 1.0
-
-        mean = np.nanmean(Y_use, axis=0)
-
-        c = colors.get(pz, None)
-
-        # --- seed lines (sottili e trasparenti) ---
-        if plot_seeds:
-            for s in range(Y_use.shape[0]):
-                y_s = Y_use[s, :]
-                plt.plot(x, y_s, color=c, alpha=seed_alpha, linewidth=seed_lw)
-
-        # --- mean line (più spessa) ---
-        plt.plot(x, mean, label=pz, color=c, linewidth=mean_lw)
-
-        # --- band ---
-        if band is not None:
-            if band.lower() == "std":
-                std = np.nanstd(Y_use, axis=0)
-                lower = mean - std
-                upper = mean + std
-                plt.fill_between(x, lower, upper, alpha=0.15, color=c)
-
-            elif band.lower() == "minmax":
-                mn_curve = np.nanmin(Y_use, axis=0)
-                mx_curve = np.nanmax(Y_use, axis=0)
-                plt.fill_between(x, mn_curve, mx_curve, alpha=0.12, color=c)
-
-    plt.xlabel("GOOD fraction")
-    plt.ylabel(index_label)
-    plt.title(title if title is not None else f"{method} — {index_label} (tutti i pezzi)")
-    plt.grid(True, alpha=0.3)
-    plt.legend()
-    plt.tight_layout()
-
-    if savepath is not None:
-        plt.savefig(savepath, dpi=200)
-    plt.show()
-
-plot_all_pieces_single_index(
-    results_by_method=results_roc_by_method,
-    good_fractions=good_fractions,
-    method="INREACH",
-    index_label="Pixel AUROC",
-    title="INREACH — ROC (Pixel AUROC) — tutti i pezzi",
-    band="std",
-    normalize_per_piece=False,
-    plot_seeds=True,
-    seed_alpha=0.08
-)
-
-plot_all_pieces_single_index(
-    results_by_method=results_pr_by_method,
-    good_fractions=good_fractions,
-    method="INREACH",
-    index_label="Pixel AUPRC",
-    title="INREACH — PR (Pixel AUPRC) — tutti i pezzi",
-    band="std",
-    normalize_per_piece=False,
-    plot_seeds=True,
-    seed_alpha=0.08
-)
-
-plot_all_pieces_single_index(
-    results_by_method=results_pro_by_method,
-    good_fractions=good_fractions,
-    method="INREACH",
-    index_label="Pixel AUC-PRO",
-    title="INREACH — PRO (Pixel AUC-PRO) — tutti i pezzi",
-    band="std",
-    normalize_per_piece=False,
-    plot_seeds=True,
-    seed_alpha=0.08
-)
 
 
 # =================================================
