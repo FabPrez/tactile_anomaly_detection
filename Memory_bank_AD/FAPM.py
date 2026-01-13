@@ -142,7 +142,7 @@ VAL_GOOD_SCOPE       = ["pos1","pos2"]
 VAL_FAULT_SCOPE      = ["pos1","pos2"]
 GOOD_FRACTION        = {
     "pos1": 0.6,
-    # "pos2": 0.05
+    #"pos2": 0.05
     
 }
 
@@ -156,7 +156,7 @@ PIECE_TO_POSITION = {
 
 IMG_SIZE             = 224
 TEST_SEED  = 42  # controlla *solo* la scelta delle immagini di validation/test
-TRAIN_SEED = 1  # lo puoi cambiare tu per variare il sottoinsieme di GOOD usati per il training
+TRAIN_SEED = 2 # lo puoi cambiare tu per variare il sottoinsieme di GOOD usati per il training
 
 # Post-process
 GAUSSIAN_SIGMA       = 4          # smoothing post-heatmap
@@ -657,7 +657,7 @@ def main():
         img_scores=out["img_scores"],
         use_threshold="pro",
         fpr_limit=0.01,
-        vis=True,
+        vis=False,
         vis_ds_or_loader=val_loader.dataset
     )
 
@@ -782,10 +782,10 @@ def run_all_fractions_for_current_piece():
 
     # stessa griglia che hai usato per i risultati SPADE
     good_fracs = [
-        0.05, 0.10, 0.15, 0.20, 0.25,
-        0.30, 0.35, 0.40, 0.45, 0.50,
-        0.55, 0.60, 0.65, 0.70, 0.75,
-        0.80, 0.85, 0.90, 0.95, 1.00,
+        0.05, 0.10, 0.15, #0.20, 0.25,
+       #0.30, 0.35, 0.40, 0.45, 0.50,
+        #0.55, 0.60, 0.65, 0.70, 0.75,
+       # 0.80, 0.85, 0.90, 0.95, 1.00,
     ]
 
     img_list   = []
@@ -794,8 +794,14 @@ def run_all_fractions_for_current_piece():
     pxpro_list = []
 
     for gf in good_fracs:
-        GOOD_FRACTION = gf
-        print(f"\n=== FAPM | PEZZO {CODICE_PEZZO}, FRAZIONE GOOD = {GOOD_FRACTION} ===")
+        GOOD_FRACTION = {"pos1": 0.6, "pos2": gf}
+        print(f"\n=== FAPM | {CODICE_PEZZO}, GOOD_FRACTION = {GOOD_FRACTION} ===")
+       # run_single_experiment()
+
+    #for gf in good_fracs:
+     #   GOOD_FRACTION = gf
+     #   print(f"\n=== FAPM | PEZZO {CODICE_PEZZO}, FRAZIONE GOOD = {GOOD_FRACTION} ===")
+    
         auc_img, px_auroc, px_auprc, px_aucpro = run_single_experiment()
 
         img_list.append(auc_img)
@@ -871,10 +877,10 @@ def run_all_pieces_and_fractions():
 
 if __name__ == "__main__":
     # 1) SOLO 1 ESPERIMENTO (usa le globali in testa)
-     main()
+        main()
 
     # 2) TUTTE LE FRAZIONI PER UN SOLO PEZZO (CODICE_PEZZO globale)
-    # run_all_fractions_for_current_piece()
+      # run_all_fractions_for_current_piece()
 
     # 3) TUTTI I PEZZI × TUTTE LE FRAZIONI
     #run_all_pieces_and_fractions()

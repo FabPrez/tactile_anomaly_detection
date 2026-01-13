@@ -130,17 +130,25 @@ METHOD = "PADIM"
 CODICE_PEZZO = "PZ1"
 
 # Posizioni "good" per il TRAIN (feature bank)
-TRAIN_POSITIONS = ["pos1"]
+TRAIN_POSITIONS = ["pos1", "pos2"]
 
 # Quanti GOOD per posizione spostare in VALIDATION (ed escludere dal TRAIN)
-VAL_GOOD_PER_POS = 20
+VAL_GOOD_PER_POS = {
+    "pos1":20,
+    "pos2": 20
+    
+}
 
 # Da quali posizioni prendere GOOD e FAULT per la VALIDATION
-VAL_GOOD_SCOPE  = ["pos1"]     # "from_train" | "all_positions" | lista
-VAL_FAULT_SCOPE = ["pos1"]     # "train_only" | "all" | lista
+VAL_GOOD_SCOPE  = ["pos1","pos2"]     # "from_train" | "all_positions" | lista
+VAL_FAULT_SCOPE = ["pos1","pos2"]     # "train_only" | "all" | lista
 
 # Percentuale di GOOD (dopo il taglio per la val) da usare nel TRAIN
-GOOD_FRACTION = 0.2
+GOOD_FRACTION = {
+    "pos1": 0.6,
+    "pos2": 0.05
+    
+}
 
 # Mappa pezzo → posizione da usare (stile InReaCh/FAPM)
 PIECE_TO_POSITION = {
@@ -159,7 +167,7 @@ RIDGE = 0.01                     # stabilizzazione cov
 
 # seed separati
 TEST_SEED  = 42   # controlla SOLO la scelta validation/test
-TRAIN_SEED = 1  # controlla SOLO la scelta del sottoinsieme GOOD nel training
+TRAIN_SEED = 42  # controlla SOLO la scelta del sottoinsieme GOOD nel training
 
 # sweep seed (come fai poi nei grafici seed0..seed9)
 TRAIN_SEEDS_TO_RUN = list(range(10))   # [0..9]
@@ -738,10 +746,10 @@ def run_all_fractions_for_current_piece():
     global GOOD_FRACTION
 
     good_fracs = [
-        0.05, 0.10, 0.15, 0.20, 0.25,
-        0.30, 0.35, 0.40, 0.45, 0.50,
-        0.55, 0.60, 0.65, 0.70, 0.75,
-        0.80, 0.85, 0.90, 0.95, 1.00,
+        0.05, 0.10, 0.15, #0.20, 0.25,
+        #0.30, 0.35, 0.40, 0.45, 0.50,
+        #0.55, 0.60, 0.65, 0.70, 0.75,
+        #0.80, 0.85, 0.90, 0.95, 1.00,
     ]
 
     img_list   = []
@@ -750,8 +758,14 @@ def run_all_fractions_for_current_piece():
     pxpro_list = []
 
     for gf in good_fracs:
-        GOOD_FRACTION = gf
-        print(f"\n=== PaDiM | PEZZO {CODICE_PEZZO}, TRAIN_SEED={TRAIN_SEED}, FRAZIONE GOOD = {GOOD_FRACTION} ===")
+        GOOD_FRACTION = {"pos1": 0.6, "pos2": gf}
+        print(f"\n=== PaDiM | {CODICE_PEZZO}, GOOD_FRACTION = {GOOD_FRACTION} ===")
+       # run_single_experiment()
+    
+    
+    #for gf in good_fracs:
+        #GOOD_FRACTION = gf
+        #print(f"\n=== PaDiM | PEZZO {CODICE_PEZZO}, TRAIN_SEED={TRAIN_SEED}, FRAZIONE GOOD = {GOOD_FRACTION} ===")
         auc_img, px_auroc, px_auprc, px_aucpro = run_single_experiment()
 
         img_list.append(auc_img)
@@ -893,8 +907,8 @@ def run_all_pieces_and_fractions():
     global CODICE_PEZZO, TRAIN_POSITIONS, VAL_GOOD_SCOPE, VAL_FAULT_SCOPE
 
     # scegli qui i pezzi che vuoi far girare
-    pieces = ["PZ1", "PZ2", "PZ3", "PZ4", "PZ5"]
-    # pieces = ["PZ4"]  # esempio
+    #pieces = ["PZ1", "PZ2", "PZ3", "PZ4", "PZ5"]
+    pieces = ["PZ1"]  # esempio
 
     all_results = {}
 
@@ -942,7 +956,7 @@ if __name__ == "__main__":
     # run_single_experiment()
 
     # 3) TUTTE LE FRAZIONI PER IL PEZZO CORRENTE (train_seed fisso)
-    # run_all_fractions_for_current_piece()
+     run_all_fractions_for_current_piece()
 
     # 4) SEED sweep × GF sweep per il pezzo corrente
     # run_all_seeds_and_fractions_for_current_piece()
@@ -951,4 +965,4 @@ if __name__ == "__main__":
     # run_all_pieces_seeds_fractions()
 
     # 6) TUTTI I PEZZI × TUTTE LE FRAZIONI (seed fisso)  
-    run_all_pieces_and_fractions()
+   # run_all_pieces_and_fractions()
