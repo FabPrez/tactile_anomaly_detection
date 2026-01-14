@@ -127,7 +127,7 @@ def print_recall_when_precision_is(results: dict, precision_target: float = 0.90
 
 # ----------------- CONFIG -----------------
 METHOD = "PADIM"
-CODICE_PEZZO = "PZ1"
+CODICE_PEZZO = "PZ3"
 
 # Posizioni "good" per il TRAIN (feature bank)
 TRAIN_POSITIONS = ["pos1", "pos2"]
@@ -145,7 +145,7 @@ VAL_FAULT_SCOPE = ["pos1","pos2"]     # "train_only" | "all" | lista
 
 # Percentuale di GOOD (dopo il taglio per la val) da usare nel TRAIN
 GOOD_FRACTION = {
-    "pos1": 0.6,
+    "pos1": 0.4,
     "pos2": 0.05
     
 }
@@ -167,7 +167,7 @@ RIDGE = 0.01                     # stabilizzazione cov
 
 # seed separati
 TEST_SEED  = 42   # controlla SOLO la scelta validation/test
-TRAIN_SEED = 42  # controlla SOLO la scelta del sottoinsieme GOOD nel training
+TRAIN_SEED = 4 # controlla SOLO la scelta del sottoinsieme GOOD nel training.
 
 # sweep seed (come fai poi nei grafici seed0..seed9)
 TRAIN_SEEDS_TO_RUN = list(range(10))   # [0..9]
@@ -181,7 +181,7 @@ VIS_PREDICTION_ON_VALID_DATASET = False
 # ----- util -----
 def embedding_concat_nn(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     """
-    Allineamento PaDiM via nearest-neighbor + concat canali.
+    Allineamento PaDiM via nearest-neighbor + concat canali.S
     x: (B, C1, H1, W1), y: (B, C2, H2, W2) con H1/W1 multipli.
     out: (B, C1+C2, H1, W1)
     """
@@ -758,7 +758,7 @@ def run_all_fractions_for_current_piece():
     pxpro_list = []
 
     for gf in good_fracs:
-        GOOD_FRACTION = {"pos1": 0.6, "pos2": gf}
+        GOOD_FRACTION = {"pos1": 0.4, "pos2": gf}
         print(f"\n=== PaDiM | {CODICE_PEZZO}, GOOD_FRACTION = {GOOD_FRACTION} ===")
        # run_single_experiment()
     
@@ -908,7 +908,7 @@ def run_all_pieces_and_fractions():
 
     # scegli qui i pezzi che vuoi far girare
     #pieces = ["PZ1", "PZ2", "PZ3", "PZ4", "PZ5"]
-    pieces = ["PZ1"]  # esempio
+    pieces = ["PZ3"]  # esempio
 
     all_results = {}
 

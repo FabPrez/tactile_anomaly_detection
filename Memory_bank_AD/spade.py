@@ -132,10 +132,10 @@ def print_recall_when_precision_is(results: dict, precision_target: float = 0.90
 
 # ----------------- CONFIG -----------------
 METHOD = "SPADE"
-CODICE_PEZZO = "PZ1"
+CODICE_PEZZO = "PZ3"
 
 # Posizioni "good" usate per il TRAIN (feature bank).
-TRAIN_POSITIONS = ["pos1","pos2","pos3","pos4"]
+TRAIN_POSITIONS = ["pos1","pos2"]
 
 # Quanti GOOD per posizione spostare nella VALIDATION (e quindi togliere dal TRAIN).
 # Può essere:
@@ -166,18 +166,18 @@ VAL_FAULT_SCOPE = ["pos1","pos2"]
 #     (20% dei good di pos1, 5% dei good di pos2 dopo la rimozione per la val;
 #      le pos non presenti nel dict usano 1.0 di default).
 GOOD_FRACTION = {
-    "pos1": 0.5,
-    # "pos2": 0.05
+    "pos1": 1.0,
+    "pos2": 0.05
     
 }
 
 # Mappa pezzo → posizione (una sola per pezzo, come in InReaCh)
 PIECE_TO_POSITION = {
-    "PZ1": "pos1,pos2,pos3,pos4",
-    #"PZ2": "pos5",
-    #"PZ3": "pos",
-    #"PZ4": "pos1",
-    #"PZ5": "pos1",
+    "PZ1": "pos1",
+    "PZ2": "pos5",
+    "PZ3": "pos1",
+    "PZ4": "pos1",
+    "PZ5": "pos1",
 }
 
 # Modello / dati
@@ -653,10 +653,10 @@ def run_all_fractions_for_current_piece():
 
     # stesse frazioni usate per InReaCh (0.05 .. 1.0)
     good_fracs = [
-        0.05, 0.10, 0.15, 0.20, 0.25,
-        0.30, 0.35, 0.40, 0.45, 0.50,
-        0.55, 0.60, 0.65, 0.70, 0.75,
-        0.80, 0.85, 0.90, 0.95, 1.00,
+        0.05, 0.10, 0.15, #0.20, 0.25,
+        #0.30, 0.35, 0.40, 0.45, 0.50,
+        #0.55, 0.60, 0.65, 0.70, 0.75,
+        #0.80, 0.85, 0.90, 0.95, 1.00,
     ]
 
     img_list   = []
@@ -664,12 +664,17 @@ def run_all_fractions_for_current_piece():
     pxpr_list  = []
     pxpro_list = []
 
-    train_pos_list = list(TRAIN_POSITIONS)
-
     for gf in good_fracs:
-        GOOD_FRACTION = {pos: gf for pos in train_pos_list}
+        GOOD_FRACTION = {"pos1": 1.0, "pos2": gf}
+        print(f"\n=== PaDiM | {CODICE_PEZZO}, GOOD_FRACTION = {GOOD_FRACTION} ===")
+       # run_single_experiment()
 
-        print(f"\n=== PEZZO {CODICE_PEZZO}, FRAZIONE {gf} ===")
+    #train_pos_list = list(TRAIN_POSITIONS)
+
+    #for gf in good_fracs:
+       # GOOD_FRACTION = {pos: gf for pos in train_pos_list}
+
+        # print(f"\n=== PEZZO {CODICE_PEZZO}, FRAZIONE {gf} ===")
         auc_img, px_auroc, px_auprc, px_aucpro = run_single_experiment()
 
         img_list.append(auc_img)
@@ -708,7 +713,7 @@ def run_all_pieces_and_fractions():
 
     # pieces = ["PZ1", "PZ2", "PZ3", "PZ4", "PZ5"]
     # pieces = ["PZ2", "PZ3", "PZ4", "PZ5"]
-    pieces = ["PZ1"]
+    pieces = ["PZ3"]
 
     all_results = {}
 
@@ -753,7 +758,7 @@ def entry_main():
     Puoi usare questo invece di main() se vuoi solo le sweep.
     """
     # ESEGUI UN SOLO ESPERIMENTO (usa le globali correnti)
-    run_single_experiment()
+    #run_single_experiment()
 
     # TUTTE LE FRAZIONI PER UN SOLO PEZZO
     # CODICE_PEZZO = "PZ3"
@@ -761,7 +766,7 @@ def entry_main():
     # TRAIN_POSITIONS[:] = [pos]
     # VAL_GOOD_SCOPE[:]  = [pos]
     # VAL_FAULT_SCOPE[:] = [pos]
-    # run_all_fractions_for_current_piece()
+    run_all_fractions_for_current_piece()
 
     # TUTTI I PEZZI × TUTTE LE FRAZIONI
     # run_all_pieces_and_fractions()
