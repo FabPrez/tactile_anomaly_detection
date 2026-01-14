@@ -144,7 +144,7 @@ VAL_GOOD_SCOPE   = ["pos1", "pos2"]
 VAL_FAULT_SCOPE  = ["pos1", "pos2"]
 GOOD_FRACTION = {
     "pos1": 0.2,
-    "pos2": 0.05
+    "pos2": 0.0
     
 }
 
@@ -1113,7 +1113,14 @@ def run_all_pieces_and_fractions():
 
 
 if __name__ == "__main__":
+    
+    seed_to_try = [42, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+
+    for seed in seed_to_try:
+        TRAIN_SEED = seed
+        main()
+    
     # main()
     # run_single_experiment()
-     run_all_fractions_for_current_piece()
+    #  run_all_fractions_for_current_piece()
     #run_all_pieces_and_fractions()
