@@ -132,13 +132,21 @@ def print_recall_when_precision_is(results: dict, precision_target: float = 0.90
 
 # ---------------- CONFIG ----------------
 METHOD = "INREACH_OFFICIAL"
-CODICE_PEZZO = "PZ5"
+CODICE_PEZZO = "PZ1"
 
-TRAIN_POSITIONS = ["pos1"]
-VAL_GOOD_PER_POS = 20
-VAL_GOOD_SCOPE   = ["pos1"]
-VAL_FAULT_SCOPE  = ["pos1"]
-GOOD_FRACTION    = 1.0
+TRAIN_POSITIONS = ["pos1", "pos2"]
+VAL_GOOD_PER_POS = {
+    "pos1":20,
+    "pos2": 20
+    
+}
+VAL_GOOD_SCOPE   = ["pos1", "pos2"]
+VAL_FAULT_SCOPE  = ["pos1", "pos2"]
+GOOD_FRACTION = {
+    "pos1": 0.2,
+    "pos2": 0.05
+    
+}
 
 # Mappa pezzo → posizione da usare
 PIECE_TO_POSITION = {
@@ -151,7 +159,7 @@ PIECE_TO_POSITION = {
 
 IMG_SIZE  = 224
 TEST_SEED  = 42  # controlla *solo* la scelta delle immagini di validation/test
-TRAIN_SEED = 9  # lo puoi cambiare tu per variare
+TRAIN_SEED = 42  # lo puoi cambiare tu per variare
 
 # InReaCh (repo)
 ASSOC_DEPTH        = 10
@@ -1020,8 +1028,8 @@ def run_single_experiment():
 def run_all_fractions_for_current_piece():
     global GOOD_FRACTION
 
-    good_fracs = [round(x/100, 3) for x in range(5, 101, 5)]
-    # good_fracs = [0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.7, 1.0]
+    # good_fracs = [round(x/100, 3) for x in range(5, 101, 5)]
+    good_fracs = [0.05, 0.1, 0.15] #0.2, 0.25, 0.3, 0.35, 0.4, 0.7, 1.0]
 
     img_list = []
     pxroc_list = []
@@ -1029,8 +1037,15 @@ def run_all_fractions_for_current_piece():
     pxpro_list = []
 
     for gf in good_fracs:
-        GOOD_FRACTION = gf
-        print(f"\n=== PEZZO {CODICE_PEZZO}, FRAZIONE {GOOD_FRACTION} ===")
+        GOOD_FRACTION = {"pos1": 0.2, "pos2": gf}
+        print(f"\n=== INREACH | {CODICE_PEZZO}, GOOD_FRACTION = {GOOD_FRACTION} ===")
+       # run_single_experiment()
+    
+    
+    
+    #for gf in good_fracs:
+        #GOOD_FRACTION = gf
+        #print(f"\n=== PEZZO {CODICE_PEZZO}, FRAZIONE {GOOD_FRACTION} ===")
         auc_img, px_auroc, px_auprc, px_aucpro = run_single_experiment()
 
         img_list.append(auc_img)
@@ -1038,13 +1053,13 @@ def run_all_fractions_for_current_piece():
         pxpr_list.append(px_auprc)
         pxpro_list.append(px_aucpro)
 
-    # print("\n### RISULTATI PER PEZZO", CODICE_PEZZO)
-    # print("good_fractions      =", good_fracs)
-    # print("image_level_AUROC   =", img_list)
-    # print("pixel_level_AUROC   =", pxroc_list)
-    # print("pixel_level_AUPRC   =", pxpr_list)
-    # print("pixel_level_AUC_PRO =", pxpro_list)
-
+    print("\n### RISULTATI PER PEZZO", CODICE_PEZZO)
+    print("good_fractions      =", good_fracs)
+    print("image_level_AUROC   =", img_list)
+    print("pixel_level_AUROC   =", pxroc_list)
+    print("pixel_level_AUPRC   =", pxpr_list)
+    print("pixel_level_AUC_PRO =", pxpro_list)
+    
     return {
         "good_fractions": good_fracs,
         "image_auroc": img_list,
@@ -1100,5 +1115,5 @@ def run_all_pieces_and_fractions():
 if __name__ == "__main__":
     # main()
     # run_single_experiment()
-    # run_all_fractions_for_current_piece()
-    run_all_pieces_and_fractions()
+     run_all_fractions_for_current_piece()
+    #run_all_pieces_and_fractions()

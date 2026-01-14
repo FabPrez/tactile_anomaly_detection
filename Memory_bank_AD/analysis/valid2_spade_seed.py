@@ -11,11 +11,11 @@ good_fractions = np.array([
 
 # ===========================
 # ROC (Pixel AUROC) PER SEED
-# PADIM – PZ1, PZ3
+# SPADE – PZ1, PZ3
 # ===========================
 
 results_roc_by_method = {
-    "PADIM": {
+    "SPADE": {
 
         "PZ1": [
             # ----- SEED 0 -----

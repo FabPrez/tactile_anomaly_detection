@@ -127,7 +127,7 @@ def print_recall_when_precision_is(results: dict, precision_target: float = 0.90
 
 # ----------------- CONFIG -----------------
 METHOD = "PADIM"
-CODICE_PEZZO = "PZ3"
+CODICE_PEZZO = "PZ1"
 
 # Posizioni "good" per il TRAIN (feature bank)
 TRAIN_POSITIONS = ["pos1", "pos2"]
@@ -167,7 +167,7 @@ RIDGE = 0.01                     # stabilizzazione cov
 
 # seed separati
 TEST_SEED  = 42   # controlla SOLO la scelta validation/test
-TRAIN_SEED = 4 # controlla SOLO la scelta del sottoinsieme GOOD nel training.
+TRAIN_SEED = 6 # controlla SOLO la scelta del sottoinsieme GOOD nel training.
 
 # sweep seed (come fai poi nei grafici seed0..seed9)
 TRAIN_SEEDS_TO_RUN = list(range(10))   # [0..9]
