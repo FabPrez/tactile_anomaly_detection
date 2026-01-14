@@ -167,7 +167,7 @@ VAL_FAULT_SCOPE = ["pos1","pos2"]
 #      le pos non presenti nel dict usano 1.0 di default).
 GOOD_FRACTION = {
     "pos1": 1.0,
-    "pos2": 0.05
+    "pos2": 0.00
     
 }
 
@@ -186,7 +186,7 @@ IMG_SIZE = 224
 
 # >>> NEW: seed separati
 TEST_SEED  = 42  # controlla *solo* la scelta delle immagini di validation/test
-TRAIN_SEED = 9  # lo puoi cambiare tu per variare il sottoinsieme di GOOD usati per il training
+TRAIN_SEED = 42  # lo puoi cambiare tu per variare il sottoinsieme di GOOD usati per il training
 
 # Visualizzazioni
 VIS_VALID_DATASET = False
@@ -453,7 +453,7 @@ def main():
         img_scores=img_scores,
         use_threshold="pro",
         fpr_limit=0.01,
-        vis=True,
+        vis=False,
         vis_ds_or_loader=val_loader.dataset
     )
 
@@ -653,6 +653,7 @@ def run_all_fractions_for_current_piece():
 
     # stesse frazioni usate per InReaCh (0.05 .. 1.0)
     good_fracs = [
+        0.00,
         0.05, 0.10, 0.15, #0.20, 0.25,
         #0.30, 0.35, 0.40, 0.45, 0.50,
         #0.55, 0.60, 0.65, 0.70, 0.75,
@@ -772,7 +773,20 @@ def entry_main():
     # run_all_pieces_and_fractions()
 
 
-if __name__ == "__main__":
+#if __name__ == "__main__":
     # puoi scegliere se usare main() “vecchio” o entry_main()
     # main()
-    entry_main()
+    #entry_main()
+if __name__ == "__main__":
+    
+    seed_to_try = [42, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+
+    for seed in seed_to_try:
+        TRAIN_SEED = seed
+        print("----- SEED: ",TRAIN_SEED)
+        main()
+    
+    # main()
+    # run_single_experiment()
+    #  run_all_fractions_for_current_piece()
+    #run_all_pieces_and_fractions()
