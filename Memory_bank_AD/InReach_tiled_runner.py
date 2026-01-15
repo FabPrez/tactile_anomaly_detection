@@ -33,13 +33,14 @@ from ad_analysis import run_pixel_level_evaluation, print_pixel_report
 METHOD = "INREACH_TILED_RUNNER"
 CODICE_PEZZO = "PZ3"
 
-TRAIN_POSITIONS = ["pos2"]
-VAL_GOOD_PER_POS = 0
-VAL_GOOD_SCOPE   = ["pos2"]
-VAL_FAULT_SCOPE  = ["pos2"]
-GOOD_FRACTION    = 1.0
+TRAIN_POSITIONS = ["pos1"]
+VAL_GOOD_PER_POS = 20
+VAL_GOOD_SCOPE   = ["pos1"]
+VAL_FAULT_SCOPE  = ["pos1"]
+GOOD_FRACTION    = 0.2
 
-SEED = 42
+TEST_SEED  = 42  # controlla *solo* la scelta delle immagini di validation/test
+TRAIN_SEED = 42  # lo puoi cambiare tu per variare
 
 # dimensione tile / input backbone
 BACKBONE_IMG_SIZE = 224
@@ -212,7 +213,8 @@ def main():
         val_good_scope=VAL_GOOD_SCOPE,
         val_good_per_pos=VAL_GOOD_PER_POS,
         good_fraction=GOOD_FRACTION,
-        seed=SEED,
+        seed=TEST_SEED,          
+        train_seed=TRAIN_SEED,
         transform=None,
         rgb_policy="fullres_only",      # come SPADE/PaDiM/FAPM tiled
     )
@@ -347,7 +349,7 @@ def main():
             img_scores=agg_scores,
             use_threshold="pro",
             fpr_limit=FPR_LIMIT,
-            vis=True,
+            vis=False,
             vis_ds_or_loader=val_set
         )
         print_pixel_report(results, title="{} | {}  tiles={}  agg={}".format(
@@ -365,4 +367,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    #main()
+
+    seed_to_try = [42, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+
+    for seed in seed_to_try:
+        TRAIN_SEED = seed
+        print("----- TRAIN_SEED:", TRAIN_SEED, "| TEST_SEED:", TEST_SEED)
+        main()
