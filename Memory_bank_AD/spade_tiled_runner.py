@@ -20,14 +20,15 @@ from ad_analysis import run_pixel_level_evaluation, print_pixel_report
 
 # ----------------- CONFIG -----------------
 METHOD = "SPADE"
-CODICE_PEZZO = "PZ4"
+CODICE_PEZZO = "PZ1"
 
 TRAIN_POSITIONS = ["pos1"]
 VAL_GOOD_PER_POS = 20
 VAL_GOOD_SCOPE = ["pos1"]
 VAL_FAULT_SCOPE = ["pos1"]
 GOOD_FRACTION = 1.0
-SEED = 42
+TEST_SEED  = 42  # controlla SOLO la scelta delle immagini di validation/test
+TRAIN_SEED = 42  # controlla SOLO la scelta del sottoinsieme GOOD usato nel training
 
 # Backbone input size (fisso a 224 per ResNet)
 BACKBONE_IMG_SIZE = 224
@@ -302,17 +303,18 @@ def main():
 
     # Dataset base SENZA crop/resize, SOLO full-res
     train_set, val_set, meta = build_ad_datasets(
-        part=CODICE_PEZZO,
-        img_size=None,
-        train_positions=TRAIN_POSITIONS,
-        val_fault_scope=VAL_FAULT_SCOPE,
-        val_good_scope=VAL_GOOD_SCOPE,
-        val_good_per_pos=VAL_GOOD_PER_POS,
-        good_fraction=GOOD_FRACTION,
-        seed=SEED,
-        transform=None,
-        rgb_policy="fullres_only",   # tiled => usa sempre le immagini full-res
-    )
+    part=CODICE_PEZZO,
+    img_size=None,
+    train_positions=TRAIN_POSITIONS,
+    val_fault_scope=VAL_FAULT_SCOPE,
+    val_good_scope=VAL_GOOD_SCOPE,
+    val_good_per_pos=VAL_GOOD_PER_POS,
+    good_fraction=GOOD_FRACTION,
+    seed=TEST_SEED,          
+    train_seed=TRAIN_SEED,   
+    transform=None,
+    rgb_policy="fullres_only",
+)
     print("[meta]", meta)
 
     # HxW dal dataset
@@ -404,7 +406,7 @@ def main():
             img_scores=agg_scores,
             use_threshold="pro",
             fpr_limit=FPR_LIMIT,
-            vis=True,
+            vis=False,
             vis_ds_or_loader=val_set
         )
         print_pixel_report(results, title="{}-TILED | {}  tiles={}  agg={}".format(
@@ -419,5 +421,15 @@ def main():
     print("\n[done] Sequenza tiled completata.")
 
 
+# if __name__ == "__main__":
+    #
+    # main()
+
 if __name__ == "__main__":
-    main()
+
+    seed_to_try = [42, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+
+    for seed in seed_to_try:
+        TRAIN_SEED = seed
+        print("----- TRAIN_SEED:", TRAIN_SEED, "| TEST_SEED:", TEST_SEED)
+        main()

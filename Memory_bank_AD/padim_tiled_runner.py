@@ -21,22 +21,23 @@ from ad_analysis import run_pixel_level_evaluation, print_pixel_report
 
 # ----------------- CONFIG -----------------
 METHOD = "PADIM_TILED"
-CODICE_PEZZO = "PZ3"
+CODICE_PEZZO = "PZ1"
 
 # Posizioni "good" per il TRAIN (feature bank)
-TRAIN_POSITIONS = ["pos2"]
+TRAIN_POSITIONS = ["pos1"]
 
 # Quanti GOOD per posizione spostare in VALIDATION (ed escludere dal TRAIN)
-VAL_GOOD_PER_POS = 0
+VAL_GOOD_PER_POS = 20
 
 # Da quali posizioni prendere GOOD e FAULT per la VALIDATION
-VAL_GOOD_SCOPE  = ["pos2"]
-VAL_FAULT_SCOPE = ["pos2"]
+VAL_GOOD_SCOPE  = ["pos1"]
+VAL_FAULT_SCOPE = ["pos1"]
 
 # Percentuale di GOOD (dopo il taglio per la val) da usare nel TRAIN
-GOOD_FRACTION = 1.0
+GOOD_FRACTION = 0.4
 
-SEED = 42
+TEST_SEED  = 42  # controlla *solo* la scelta delle immagini di validation/test
+TRAIN_SEED = 42 # lo puoi cambiare tu per variare il sottoinsieme di GOOD usati per il training
 
 # PaDiM
 PADIM_D   = 550          # canali selezionati (<= C_total)
@@ -382,7 +383,8 @@ def main():
         val_good_scope=VAL_GOOD_SCOPE,
         val_good_per_pos=VAL_GOOD_PER_POS,
         good_fraction=GOOD_FRACTION,
-        seed=SEED,
+        seed=TEST_SEED,          
+        train_seed=TRAIN_SEED,
         transform=None,
         rgb_policy="fullres_only",   # tiled => usa sempre le immagini full-res
     )
@@ -478,7 +480,7 @@ def main():
             img_scores=img_scores_list,
             use_threshold="pro",
             fpr_limit=FPR_LIMIT,
-            vis=True,
+            vis=False,
             vis_ds_or_loader=val_set
         )
         print_pixel_report(results, title="{} | {}  tiles={}  overlap={}".format(
@@ -494,4 +496,10 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+   # main()
+    seed_to_try = [42, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+
+    for seed in seed_to_try:
+        TRAIN_SEED = seed
+        print("----- TRAIN_SEED:", TRAIN_SEED, "| TEST_SEED:", TEST_SEED)
+        main()
