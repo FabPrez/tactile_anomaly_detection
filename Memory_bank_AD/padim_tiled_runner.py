@@ -21,7 +21,7 @@ from ad_analysis import run_pixel_level_evaluation, print_pixel_report
 
 # ----------------- CONFIG -----------------
 METHOD = "PADIM_TILED"
-CODICE_PEZZO = "PZ1"
+CODICE_PEZZO = "PZ3"
 
 # Posizioni "good" per il TRAIN (feature bank)
 TRAIN_POSITIONS = ["pos1"]
