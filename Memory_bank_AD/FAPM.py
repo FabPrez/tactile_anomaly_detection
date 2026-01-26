@@ -4,6 +4,10 @@
 # - Auto-build pickle se mancano, con chiavi compatibili con la repo ufficiale:
 #     final_near_core_c, final_far_core_c, final_near_core_f, final_far_core_f, fn_selector_c, fn_selector_f
 # - Integrato con le tue utility (datasets, loaders, valutazione)
+#
+# >>> MODIFICA APPLICATA:
+#     cache pickle SEPARATA PER OGNI TRAIN_SEED usando METHOD_SEEDED = f"{METHOD}_seed{TRAIN_SEED}"
+#     quindi: load_split_pickle/save_split_pickle usano METHOD_SEEDED e NON METHOD.
 
 import os, math, time, random, pickle
 from typing import List, Dict, Tuple, Optional
@@ -94,7 +98,6 @@ def print_recall_when_precision_is(results: dict, precision_target: float = 0.85
     """
     pr = (results.get("curves", {}) or {}).get("pr", {}) or {}
 
-    # prova chiavi più probabili
     recall = _first_not_none(
         pr.get("recall", None),
         pr.get("x", None),
@@ -130,20 +133,18 @@ def print_recall_when_precision_is(results: dict, precision_target: float = 0.85
 
 # ---------------- CONFIG ----------------
 METHOD               = "FAPM"     # nome metodo per salvataggio pickle (cartelle tue utility)
-CODICE_PEZZO         = "PZ3"
+CODICE_PEZZO         = "PZ1"
 
 TRAIN_POSITIONS      = ["pos1", "pos2"]  # posizioni usate per il TRAINING
 VAL_GOOD_PER_POS     = {
-    "pos1":20,
+    "pos1": 20,
     "pos2": 20
-    
 }
-VAL_GOOD_SCOPE       = ["pos1","pos2"]
-VAL_FAULT_SCOPE      = ["pos1","pos2"]
+VAL_GOOD_SCOPE       = ["pos1", "pos2"]
+VAL_FAULT_SCOPE      = ["pos1", "pos2"]
 GOOD_FRACTION        = {
     "pos1": 0.6,
-    #"pos2": 0.05
-    
+    "pos2": 0.00
 }
 
 PIECE_TO_POSITION = {
@@ -154,21 +155,21 @@ PIECE_TO_POSITION = {
     "PZ5": "pos1",
 }
 
-IMG_SIZE             = 224
+IMG_SIZE   = 224
 TEST_SEED  = 42  # controlla *solo* la scelta delle immagini di validation/test
-TRAIN_SEED = 2 # lo puoi cambiare tu per variare il sottoinsieme di GOOD usati per il training
+TRAIN_SEED = 42  # lo puoi cambiare tu per variare il sottoinsieme di GOOD usati per il training
 
 # Post-process
-GAUSSIAN_SIGMA       = 4          # smoothing post-heatmap
+GAUSSIAN_SIGMA = 4  # smoothing post-heatmap
 
 # --- Coreset & Adaptive near/far (repo-style) ---
-CORESET_RATIO        = 0.10       # near ratio
-ADAPTIVE_RATIO       = 2.0        # far = near * ADAPTIVE_RATIO
-SELECTOR_PERCENTILE  = 90         # celle "difficili" = d_imax in top p%
+CORESET_RATIO        = 0.10  # near ratio
+ADAPTIVE_RATIO       = 2.0   # far = near * ADAPTIVE_RATIO
+SELECTOR_PERCENTILE  = 90    # celle "difficili" = d_imax in top p%
 
 # Inference
-K_NN                 = 4          # n_neighbors=4 (repo)
-BATCH_TEST           = 1          # la repo testa con batch_size=1; qui supportiamo >1, ma RC omogenea
+K_NN       = 4   # n_neighbors=4 (repo)
+BATCH_TEST = 1   # la repo testa con batch_size=1; qui supportiamo >1, ma RC omogenea
 
 # ---------------------------------------------------
 
@@ -207,6 +208,7 @@ class STPM(nn.Module):
 def pairwise_distances(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return torch.cdist(x, y, p=2.0)
 
+
 def kcenter_greedy(X: torch.Tensor, m: int, seed: int = 0) -> np.ndarray:
     """
     Greedy k-center su righe di X (N,d). Ritorna indici numpy (m,).
@@ -225,6 +227,7 @@ def kcenter_greedy(X: torch.Tensor, m: int, seed: int = 0) -> np.ndarray:
         d_new = pairwise_distances(X, X[idx:idx+1, :]).squeeze(1)
         min_d = torch.minimum(min_d, d_new)
     return np.array(centers, dtype=np.int64)
+
 
 def compute_cell_dimax(X: torch.Tensor, centers_idx: np.ndarray) -> float:
     """
@@ -290,11 +293,10 @@ def collect_train_vectors(
         for b in range(B):
             fb = f[b:b+1]
             cb = c[b:b+1]
-            # split
-            fine_ = _split_into_cells_and_subpatches(fb, layer="fine")    # (49,16,Cf)
-            coarse_ = _split_into_cells_and_subpatches(cb, layer="coarse") # (49, 4,Cc)
+            fine_   = _split_into_cells_and_subpatches(fb, layer="fine")     # (49,16,Cf)
+            coarse_ = _split_into_cells_and_subpatches(cb, layer="coarse")  # (49, 4,Cc)
 
-            fine_np = fine_.cpu().numpy()
+            fine_np   = fine_.cpu().numpy()
             coarse_np = coarse_.cpu().numpy()
 
             for cell in range(49):
@@ -319,7 +321,7 @@ def collect_train_vectors(
 
 # ==================== costruzione near/far + selector (repo-style) ====================
 def _build_layer_memory(
-    layer_list: List[List[np.ndarray]],          # 49 x S list of np arrays (N x C)
+    layer_list: List[List[np.ndarray]],   # 49 x S list of np arrays (N x C)
     coreset_ratio: float,
     adaptive_ratio: float,
     selector_percentile: float,
@@ -330,7 +332,7 @@ def _build_layer_memory(
     Ritorna tuple:
       near_bank: (49, S, M_near, C)
       far_bank : (49, S, M_far , C)
-        selector : (49,) boolean (True => usa far a test-time)
+      selector : (49,) boolean (True => usa far a test-time)
     """
     S = len(layer_list[0])  # 16 (fine) o 4 (coarse)
     N = layer_list[0][0].shape[0]  # #GOOD train (costante)
@@ -341,7 +343,6 @@ def _build_layer_memory(
     m_near = min(m_near, N)
     m_far  = min(m_far,  N)
 
-    # Per coerenza tensori rettangolari, usiamo m_near/m_far costanti su tutte le celle
     near_bank = np.zeros((49, S, m_near, C), dtype=np.float32)
     far_bank  = np.zeros((49, S, m_far , C), dtype=np.float32)
 
@@ -366,10 +367,8 @@ def _build_layer_memory(
     for cell in range(49):
         for sp in range(S):
             X = torch.from_numpy(layer_list[cell][sp])
-            # near
             idx_n = kcenter_greedy(X, m=m_near, seed=seed)
             near_bank[cell, sp] = X[idx_n].cpu().numpy().astype(np.float32)
-            # far
             idx_f = kcenter_greedy(X, m=m_far, seed=seed)
             far_bank[cell, sp]  = X[idx_f].cpu().numpy().astype(np.float32)
 
@@ -400,9 +399,8 @@ def build_memory_payload(
         "final_far_core_f":  far_f,                # (49,16,M_far ,Cf)
         "final_near_core_c": near_c,               # (49, 4,M_near,Cc)
         "final_far_core_c":  far_c,                # (49, 4,M_far ,Cc)
-        "fn_selector_f":     sel_f.astype(np.uint8).reshape(-1, 1),  # (49,1) compatibile con squeeze()
+        "fn_selector_f":     sel_f.astype(np.uint8).reshape(-1, 1),  # (49,1)
         "fn_selector_c":     sel_c.astype(np.uint8).reshape(-1, 1),
-        # info opzionali
         "cfg": {
             "coreset_ratio": float(CORESET_RATIO),
             "adaptive_ratio": float(ADAPTIVE_RATIO),
@@ -421,20 +419,16 @@ def _cdist_topk_mean(q: torch.Tensor, bank: torch.Tensor, k: int) -> torch.Tenso
     bank: (P, M, C)        # banca per cella, M = m_near o m_far
     return: (P, k)         # sempre k NN (con padding se M < k)
     """
-    # Trattiamo P come batch: cdist((P,1,C),(P,M,C)) -> (P,1,M) -> (P,M)
     D = torch.cdist(q.unsqueeze(1), bank)   # (P, 1, M)
     D = D.squeeze(1)                        # (P, M)
     M = D.shape[1]
 
-    # k effettivo = quanti vettori ci sono davvero in memory
     k_eff = min(k, M)
     vals, _ = torch.topk(D, k=k_eff, largest=False, dim=1)  # (P, k_eff)
 
-    # Se ho meno di k vettori in memoria, replico l'ultimo vicino
-    # per avere comunque (P, k) ed evitare mismatch di shape.
     if k_eff < k:
-        last = vals[:, -1:].expand(-1, k - k_eff)           # (P, k - k_eff)
-        vals = torch.cat([vals, last], dim=1)               # (P, k)
+        last = vals[:, -1:].expand(-1, k - k_eff)
+        vals = torch.cat([vals, last], dim=1)
 
     return vals
 
@@ -455,44 +449,42 @@ def inference_single_image(
     f, c = model(x)  # (1,Cf,28,28) & (1,Cc,14,14)
 
     # 2) split in (49,sub,C)
-    fine_q   = _split_into_cells_and_subpatches(f, layer="fine")    # (49,16,Cf)
-    coarse_q = _split_into_cells_and_subpatches(c, layer="coarse")  # (49, 4,Cc)
+    fine_q   = _split_into_cells_and_subpatches(f, layer="fine")     # (49,16,Cf)
+    coarse_q = _split_into_cells_and_subpatches(c, layer="coarse")   # (49, 4,Cc)
 
     # 3) carica memory su device
-    near_f = torch.from_numpy(mem["final_near_core_f"]).to(device)     # (49,16,Mn,Cf)
-    far_f  = torch.from_numpy(mem["final_far_core_f"]).to(device)      # (49,16,Mf,Cf)
-    near_c = torch.from_numpy(mem["final_near_core_c"]).to(device)     # (49, 4,Mn,Cc)
-    far_c  = torch.from_numpy(mem["final_far_core_c"]).to(device)      # (49, 4,Mf,Cc)
-    sel_f  = torch.from_numpy(mem["fn_selector_f"]).to(device).squeeze().bool()  # (49,)
-    sel_c  = torch.from_numpy(mem["fn_selector_c"]).to(device).squeeze().bool()  # (49,)
+    near_f = torch.from_numpy(mem["final_near_core_f"]).to(device)
+    far_f  = torch.from_numpy(mem["final_far_core_f"]).to(device)
+    near_c = torch.from_numpy(mem["final_near_core_c"]).to(device)
+    far_c  = torch.from_numpy(mem["final_far_core_c"]).to(device)
+    sel_f  = torch.from_numpy(mem["fn_selector_f"]).to(device).squeeze().bool()
+    sel_c  = torch.from_numpy(mem["fn_selector_c"]).to(device).squeeze().bool()
 
     # 4) per cella: scegli near/far e calcola kNN
     score_patch_f = torch.zeros((49, 16, K_NN), device=device, dtype=torch.float32)
     score_patch_c = torch.zeros((49,  4, K_NN), device=device, dtype=torch.float32)
 
     for cell in range(49):
-        # fine
         qf = fine_q[cell].to(device)  # (16,Cf)
         bf = (far_f[cell] if sel_f[cell] else near_f[cell])  # (16,M,Cf)
-        score_patch_f[cell] = _cdist_topk_mean(qf, bf, K_NN)  # (16,k)
+        score_patch_f[cell] = _cdist_topk_mean(qf, bf, K_NN)
 
-        # coarse
         qc = coarse_q[cell].to(device)  # (4,Cc)
         bc = (far_c[cell] if sel_c[cell] else near_c[cell])  # (4,M,Cc)
-        score_patch_c[cell] = _cdist_topk_mean(qc, bc, K_NN)  # (4,k)
+        score_patch_c[cell] = _cdist_topk_mean(qc, bc, K_NN)
 
     # 5) allinea coarse (4) a fine (16) ripetendo ×4 (repo)
     score_patch_c_up = score_patch_c.repeat_interleave(4, dim=1)  # (49,16,k)
 
-    # 6) somma fine+coarse → score_patch totale (49,16,k)
+    # 6) somma fine+coarse
     score_patch = score_patch_f + score_patch_c_up
 
-    # 7) anomaly map a 28x28 (repo: rearrange)
+    # 7) anomaly map a 28x28
     amap_49x16 = score_patch[:, :, 0]  # (49,16)
-    amap = amap_49x16.view(7, 7, 4, 4).permute(0, 2, 1, 3).contiguous().view(28, 28)  # (28,28)
+    amap = amap_49x16.view(7, 7, 4, 4).permute(0, 2, 1, 3).contiguous().view(28, 28)
 
     # 8) image-level score (repo)
-    score_patches = score_patch.view(49 * 16, K_NN)  # (784, k)
+    score_patches = score_patch.view(49 * 16, K_NN)  # (784,k)
     Nb = score_patches[torch.argmax(score_patches[:, 0])]  # (k,)
     w = 1.0 - (torch.exp(Nb).max() / torch.exp(Nb).sum())
     image_score = float(w.item() * score_patches[:, 0].max().item())
@@ -559,10 +551,11 @@ def main():
     np.random.seed(TRAIN_SEED)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Nessuna normalizzazione: transform=None
+    # >>> MODIFICA: cache pickle separata per seed
+    METHOD_SEEDED = f"{METHOD}_seed{TRAIN_SEED}"
+
     transform = None
 
-    # Datasets & loaders (GOOD/FAULT come da tue utility)
     train_set, val_set, meta = build_ad_datasets(
         part=CODICE_PEZZO,
         img_size=IMG_SIZE,
@@ -574,7 +567,7 @@ def main():
         seed=TEST_SEED,
         train_seed=TRAIN_SEED,
         transform=None,
-        debug_print_val_paths=False,   # <<< accendi la stampa
+        debug_print_val_paths=False,
     )
     TRAIN_TAG = meta["train_tag"]
     print("[meta]", meta)
@@ -583,17 +576,15 @@ def main():
     print(f"Val  FAULT (pos {meta['val_fault_positions']}): {meta['counts']['val_fault']}")
     print(f"Val  TOT: {meta['counts']['val_total']}")
 
-    # === Unica modifica richiesta: batch di validazione = 1 (repo-faithful) ===
     train_loader, _ = make_loaders(train_set, val_set, batch_size=max(8, BATCH_TEST), device=device)
     _, val_loader   = make_loaders(train_set, val_set, batch_size=1,                   device=device)
 
-    # Backbone
     model = STPM(device=device).to(device).eval()
 
-    # Memory: carica pickle repo-style oppure costruisci
+    # Memory: carica pickle (seed-specific) oppure costruisci
     need_build = False
     try:
-        mem_payload = load_split_pickle(CODICE_PEZZO, TRAIN_TAG, split="train", method=METHOD)
+        mem_payload = load_split_pickle(CODICE_PEZZO, TRAIN_TAG, split="train", method=METHOD_SEEDED)
         required = {
             "final_near_core_c", "final_far_core_c",
             "final_near_core_f", "final_far_core_f",
@@ -606,12 +597,12 @@ def main():
         need_build = True
 
     if need_build:
-        print("[pickle] Nessuna memory compatibile → build near/far + selector (repo-style)")
+        print(f"[pickle] Nessuna memory compatibile → build near/far + selector (repo-style) -> {METHOD_SEEDED}")
         mem_payload = build_memory_payload(device, model, train_loader)
-        save_split_pickle(mem_payload, CODICE_PEZZO, TRAIN_TAG, split="train", method=METHOD)
+        save_split_pickle(mem_payload, CODICE_PEZZO, TRAIN_TAG, split="train", method=METHOD_SEEDED)
         print("[pickle] Memory salvata (repo-style).")
     else:
-        print("[pickle] Memory caricata da cache (repo-style).")
+        print(f"[pickle] Memory caricata da cache (repo-style) -> {METHOD_SEEDED}")
 
     # Validazione
     out = run_validation(device, model, val_loader, mem_payload)
@@ -620,12 +611,10 @@ def main():
     img_scores = out["img_scores"]                 # (N_img,)
     gt_img     = out["gt_img"].astype(np.int32)    # 0=good, 1=fault
 
-    # ROC, AUC
     fpr, tpr, thresholds = roc_curve(gt_img, img_scores)
     auc_img = roc_auc_score(gt_img, img_scores)
     print(f"[image-level] ROC-AUC ({CODICE_PEZZO}/train={TRAIN_TAG}): {auc_img:.3f}")
 
-    # Soglia di Youden
     J = tpr - fpr
     best_idx = int(np.argmax(J))
     best_thr = float(thresholds[best_idx])
@@ -636,7 +625,6 @@ def main():
     print(f"[image-level] CM -> TN:{tn}  FP:{fp}  FN:{fn}  TP:{tp}")
     print(f"[image-level] TPR:{tpr[best_idx]:.3f}  FPR:{fpr[best_idx]:.3f}")
 
-    # Curva ROC
     fig, ax = plt.subplots(1, 2, figsize=(10, 4))
     ax[0].plot(fpr, tpr, label=f"AUC={auc_img:.3f}")
     ax[0].plot([0, 1], [0, 1], 'k--', linewidth=1)
@@ -661,10 +649,12 @@ def main():
         vis_ds_or_loader=val_loader.dataset
     )
 
-    # >>> NEW: stampa recall quando precision=0.900 (curva PR)
-    print_recall_when_precision_is(results, precision_target=0.900, tag=f"{METHOD}|{CODICE_PEZZO}|{TRAIN_TAG}")
-
-    print_pixel_report(results, title=f"{METHOD} | {CODICE_PEZZO}/train={TRAIN_TAG}")
+    print_recall_when_precision_is(
+        results,
+        precision_target=0.900,
+        tag=f"{METHOD_SEEDED}|{CODICE_PEZZO}|{TRAIN_TAG}"
+    )
+    print_pixel_report(results, title=f"{METHOD_SEEDED} | {CODICE_PEZZO}/train={TRAIN_TAG}")
 
 
 def run_single_experiment():
@@ -675,14 +665,15 @@ def run_single_experiment():
     Ritorna:
         (image_auroc, pixel_auroc, pixel_auprc, pixel_aucpro)
     """
-    # seed come nel main
     torch.manual_seed(TRAIN_SEED)
     random.seed(TRAIN_SEED)
     np.random.seed(TRAIN_SEED)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # ======= DATASET =======
-    transform = None  # nessuna normalizzazione, come nel main
+    # >>> MODIFICA: cache pickle separata per seed
+    METHOD_SEEDED = f"{METHOD}_seed{TRAIN_SEED}"
+
+    transform = None
 
     train_set, val_set, meta = build_ad_datasets(
         part=CODICE_PEZZO,
@@ -695,21 +686,18 @@ def run_single_experiment():
         seed=TEST_SEED,
         train_seed=TRAIN_SEED,
         transform=None,
-        debug_print_val_paths=False,   # <<< accendi la stampa
+        debug_print_val_paths=False,
     )
     TRAIN_TAG = meta["train_tag"]
 
-    # loaders (stessa logica del main)
     train_loader, _ = make_loaders(train_set, val_set, batch_size=max(8, BATCH_TEST), device=device)
     _, val_loader   = make_loaders(train_set, val_set, batch_size=1,                   device=device)
 
-    # ======= MODELLO =======
     model = STPM(device=device).to(device).eval()
 
-    # ======= MEMORY (stessa logica del main, nessuna funzione nuova) =======
     need_build = False
     try:
-        mem_payload = load_split_pickle(CODICE_PEZZO, TRAIN_TAG, split="train", method=METHOD)
+        mem_payload = load_split_pickle(CODICE_PEZZO, TRAIN_TAG, split="train", method=METHOD_SEEDED)
         required = {
             "final_near_core_c", "final_far_core_c",
             "final_near_core_f", "final_far_core_f",
@@ -722,20 +710,19 @@ def run_single_experiment():
         need_build = True
 
     if need_build:
-        print("[pickle] Nessuna memory compatibile → build near/far + selector (repo-style)")
+        print(f"[pickle] Nessuna memory compatibile → build near/far + selector (repo-style) -> {METHOD_SEEDED}")
         mem_payload = build_memory_payload(device, model, train_loader)
-        # save_split_pickle(mem_payload, CODICE_PEZZO, TRAIN_TAG, split="train", method=METHOD)
-        print("[pickle] Memory salvata (repo-style).")
+        # Se vuoi salvare anche qui (attenzione: tanti esperimenti), scommenta:
+        # save_split_pickle(mem_payload, CODICE_PEZZO, TRAIN_TAG, split="train", method=METHOD_SEEDED)
+        print("[pickle] Memory costruita (repo-style).")
     else:
-        print("[pickle] Memory caricata da cache (repo-style).")
+        print(f"[pickle] Memory caricata da cache (repo-style) -> {METHOD_SEEDED}")
 
-    # ======= VALIDAZIONE =======
     out = run_validation(device, model, val_loader, mem_payload)
 
-    img_scores = out["img_scores"]                 # (N_img,)
-    gt_img     = out["gt_img"].astype(np.int32)    # 0=good, 1=fault
+    img_scores = out["img_scores"]
+    gt_img     = out["gt_img"].astype(np.int32)
 
-    # ======= IMAGE-LEVEL =======
     fpr, tpr, thresholds = roc_curve(gt_img, img_scores)
     auc_img = roc_auc_score(gt_img, img_scores)
 
@@ -745,7 +732,6 @@ def run_single_experiment():
     preds = (img_scores >= best_thr).astype(np.int32)
     tn, fp, fn, tp = confusion_matrix(gt_img, preds, labels=[0, 1]).ravel()
 
-    # ======= PIXEL-LEVEL =======
     results = run_pixel_level_evaluation(
         score_map_list=list(out["raw_score_maps"]),
         val_set=val_set,
@@ -756,8 +742,11 @@ def run_single_experiment():
         vis_ds_or_loader=None
     )
 
-    #  stampa recall quando precision=0.850 (curva PR)
-    print_recall_when_precision_is(results, precision_target=0.850, tag=f"{METHOD}|{CODICE_PEZZO}|gf={GOOD_FRACTION}")
+    print_recall_when_precision_is(
+        results,
+        precision_target=0.850,
+        tag=f"{METHOD_SEEDED}|{CODICE_PEZZO}|gf={GOOD_FRACTION}"
+    )
 
     pixel_auroc   = float(results["curves"]["roc"]["auc"])
     pixel_auprc   = float(results["curves"]["pr"]["auprc"])
@@ -768,7 +757,7 @@ def run_single_experiment():
     print(f"[image-level] CM -> TN:{tn}  FP:{fp}  FN:{fn}  TP:{tp}")
     print(f"[image-level] TPR:{tpr[best_idx]:.3f}  FPR:{fpr[best_idx]:.3f}")
 
-    print_pixel_report(results, title=f"{METHOD} | {CODICE_PEZZO}/train={TRAIN_TAG} | gf={GOOD_FRACTION}")
+    print_pixel_report(results, title=f"{METHOD_SEEDED} | {CODICE_PEZZO}/train={TRAIN_TAG} | gf={GOOD_FRACTION}")
 
     return float(auc_img), pixel_auroc, pixel_auprc, pixel_auc_pro
 
@@ -780,12 +769,10 @@ def run_all_fractions_for_current_piece():
     """
     global GOOD_FRACTION
 
-    # stessa griglia che hai usato per i risultati SPADE
     good_fracs = [
-        0.05, 0.10, 0.15, #0.20, 0.25,
-       #0.30, 0.35, 0.40, 0.45, 0.50,
-        #0.55, 0.60, 0.65, 0.70, 0.75,
-       # 0.80, 0.85, 0.90, 0.95, 1.00,
+        0.00,
+        # 0.05, 0.10, 0.15, 0.20, 0.25,
+        # ...
     ]
 
     img_list   = []
@@ -796,12 +783,7 @@ def run_all_fractions_for_current_piece():
     for gf in good_fracs:
         GOOD_FRACTION = {"pos1": 0.6, "pos2": gf}
         print(f"\n=== FAPM | {CODICE_PEZZO}, GOOD_FRACTION = {GOOD_FRACTION} ===")
-       # run_single_experiment()
 
-    #for gf in good_fracs:
-     #   GOOD_FRACTION = gf
-     #   print(f"\n=== FAPM | PEZZO {CODICE_PEZZO}, FRAZIONE GOOD = {GOOD_FRACTION} ===")
-    
         auc_img, px_auroc, px_auprc, px_aucpro = run_single_experiment()
 
         img_list.append(auc_img)
@@ -834,10 +816,7 @@ def run_all_pieces_and_fractions():
     """
     global CODICE_PEZZO, TRAIN_POSITIONS, VAL_GOOD_SCOPE, VAL_FAULT_SCOPE
 
-    # scegli qui i pezzi che vuoi far girare
-    # pieces = ["PZ1", "PZ2", "PZ3", "PZ4", "PZ5"]
     pieces = ["PZ3"]
-
     all_results = {}
 
     for pezzo in pieces:
@@ -877,10 +856,17 @@ def run_all_pieces_and_fractions():
 
 if __name__ == "__main__":
     # 1) SOLO 1 ESPERIMENTO (usa le globali in testa)
-        main()
+    # main()
 
     # 2) TUTTE LE FRAZIONI PER UN SOLO PEZZO (CODICE_PEZZO globale)
-      # run_all_fractions_for_current_piece()
+    # run_all_fractions_for_current_piece()
 
     # 3) TUTTI I PEZZI × TUTTE LE FRAZIONI
-    #run_all_pieces_and_fractions()
+    # run_all_pieces_and_fractions()
+
+    seed_to_try = [42, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+
+    for seed in seed_to_try:
+        TRAIN_SEED = seed
+        print("----- SEED: ", TRAIN_SEED)
+        main()
